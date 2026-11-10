@@ -1,0 +1,92 @@
+---
+- name: Deploy RHEL 10 Image Mode Server with Goose-RedHat
+  hosts: localhost
+  become: true
+  vars:
+    image_name: "goose-rhel10-troubleshooter"
+    # Set to 'kvm' to provision a libvirt VM, or 'podman' to run as a local container
+    deployment_mode: "kvm" 
+    base_image: "registry.redhat.io/rhel10/rhel-bootc:latest"
+    build_dir: "/opt/goose-image-build"
+    vm_name: "goose-admin-node"
+    
+  pre_tasks:
+    - name: Ensure required deployment dependencies are installed
+      ansible.builtin.package:
+        name:
+          - podman
+          - libvirt
+          - virt-install
+          - qemu-kvm
+        state: present
+
+    - name: Ensure libvirtd service is running and enabled (KVM mode only)
+      when: deployment_mode == 'kvm'
+      ansible.builtin.service:
+        name: libvirtd
+        state: started
+        enabled: true
+
+  tasks:
+    - name: Ensure build directory exists
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create RHEL 10 bootc Containerfile
+      ansible.builtin.copy:
+        dest: "{{ build_dir }}/Containerfile"
+        content: |
+          FROM {{ base_image }}
+
+          # Enable the RHEL 10 extensions repository for goose-redhat
+          RUN subscription-manager repos --enable rhel-10-for-$(arch)-extensions-rpms && \
+              dnf install -y goose-redhat insights-client && \
+              dnf clean all
+
+          # Enable Insights client to run on boot
+          RUN systemctl enable insights-clientd.service
+          
+          # Optional: Pre-configure SSH keys or users here if bypassing cloud-init
+
+    - name: Build the RHEL 10 bootc image using Podman
+      ansible.builtin.command:
+        cmd: podman build -t localhost/{{ image_name }}:latest -f Containerfile .
+        chdir: "{{ build_dir }}"
+      changed_when: true
+
+    - name: Run directly in Podman (Image Mode Container)
+      when: deployment_mode == 'podman'
+      ansible.builtin.command:
+        cmd: >
+          podman run -d --name {{ vm_name }}
+          --privileged
+          -v /sys/fs/cgroup:/sys/fs/cgroup:rw
+          localhost/{{ image_name }}:latest /sbin/init
+      register: podman_run
+      changed_when: podman_run.rc == 0
+
+    - name: Generate QEMU (qcow2) disk using bootc-image-builder
+      when: deployment_mode == 'kvm'
+      ansible.builtin.command:
+        cmd: >
+          podman run --rm -i --privileged --pull=newer
+          -v /var/lib/containers/storage:/var/lib/containers/storage
+          -v {{ build_dir }}/output:/output
+          registry.redhat.io/rhel10/bootc-image-builder:latest
+          --type qcow2 localhost/{{ image_name }}:latest
+      args:
+        creates: "{{ build_dir }}/output/qcow2/disk.qcow2"
+
+    - name: Deploy to KVM via virt-install
+      when: deployment_mode == 'kvm'
+      ansible.builtin.command:
+        cmd: >
+          virt-install --name {{ vm_name }}
+          --memory 4096 --vcpus 2
+          --os-variant rhel10.0
+          --import --disk {{ build_dir }}/output/qcow2/disk.qcow2,format=qcow2
+          --network default --noautoconsole
+      register: kvm_deploy
+      changed_when: kvm_deploy.rc == 0
