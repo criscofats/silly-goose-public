@@ -8,11 +8,23 @@ After=network-online.target
 
 [Container]
 ContainerName={{ vm_name }}
+# Stable hostname, so RHSM/Insights show a recognisable name instead of the
+# random container ID.
+HostName={{ vm_name }}
 Image={{ image_ref }}
 Exec=/sbin/init
 # Persist /var (home dirs, /root, goose session history) across image updates,
 # matching bootc semantics on a real host.
-Volume={{ vm_name }}-var:/var
+# :Z relabels the volume for each new container. Without it, files copied with
+# their SELinux label preserved (goose-init.sh uses `cp -pa`) keep the previous
+# container's MCS categories and become unreadable after a restart/update.
+Volume={{ vm_name }}-var:/var:Z
+# Keep the Red Hat registration (RHSM identity + entitlement certs) across
+# container re-creation. On a real bootc host /etc persists; here it would be
+# lost with the container layer on every image update. The CLA backend
+# authenticates with /etc/pki/consumer/cert.pem.
+Volume={{ vm_name }}-rhsm-consumer:/etc/pki/consumer:Z
+Volume={{ vm_name }}-rhsm-entitlement:/etc/pki/entitlement:Z
 {% if registration_enabled %}
 Volume={{ credstore_dir }}:/run/credstore:ro,Z
 {% endif %}

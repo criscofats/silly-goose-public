@@ -1,8 +1,7 @@
 [Unit]
-Description=Register with Red Hat Subscription Management and Insights (first boot)
+Description=Register with Red Hat Subscription Management and Insights (if not registered)
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=!/var/lib/goose-register/done
 
 [Service]
 Type=oneshot

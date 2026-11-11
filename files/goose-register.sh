@@ -1,5 +1,6 @@
 #!/bin/bash
-# First-boot registration for the goose troubleshooting node.
+# Boot-time registration for the goose troubleshooting node. Idempotent: it
+# acts on the actual registration state, not on a marker file.
 # Credentials arrive as systemd credentials; nothing is stored in the image.
 set -euo pipefail
 
@@ -21,8 +22,10 @@ else
 fi
 
 # --register also enables the insights-client timer.
-insights-client --register
+if [[ -e /etc/insights-client/.registered ]]; then
+    echo "goose-register: already registered with Insights."
+else
+    insights-client --register
+fi
 
-mkdir -p /var/lib/goose-register
-touch /var/lib/goose-register/done
 echo "goose-register: registration complete."

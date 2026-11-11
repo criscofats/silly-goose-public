@@ -152,6 +152,7 @@
       loop:
         - goose-register.service
         - goose-register.sh
+        - goose-verify.sh
 
     - name: Record current image ID (if any)
       ansible.builtin.command: podman image inspect {{ image_ref }}
@@ -239,6 +240,28 @@
                      or container_info.rc != 0
                      or (container_info.stdout | from_json)[0].Image != image_id)
                  else 'started' }}
+
+        - name: Wait for the container to finish booting (includes first-boot registration)
+          when: goose_verify
+          ansible.builtin.command: podman exec {{ vm_name }} systemctl is-system-running --wait
+          register: container_boot
+          until: container_boot.stdout in ['running', 'degraded']
+          retries: 12
+          delay: 5
+          changed_when: false
+          failed_when: false
+
+        - name: Verify goose uses the RHEL command-line assistant backend
+          when: goose_verify
+          ansible.builtin.command: podman exec {{ vm_name }} /usr/libexec/goose-verify
+          register: goose_verify_result
+          changed_when: false
+          failed_when: goose_verify_result.rc not in [0, 2]
+
+        - name: Report goose backend verification
+          when: goose_verify
+          ansible.builtin.debug:
+            msg: "{{ goose_verify_result.stdout_lines }}"
 
     # -------------------------------------------------------------------- kvm
     - name: KVM deployment
@@ -363,6 +386,34 @@
           delay: 5
           changed_when: false
           failed_when: false
+
+        - name: Verify goose uses the RHEL command-line assistant backend (over SSH)
+          when: goose_verify and vm_addr.stdout is search('ipv4')
+          become: false   # use the invoking user's SSH key
+          ansible.builtin.command:
+            argv:
+              - ssh
+              - -o
+              - BatchMode=yes
+              - -o
+              - ConnectTimeout=10
+              - -o
+              - StrictHostKeyChecking=no
+              - -o
+              - UserKnownHostsFile=/dev/null
+              - "{{ admin_user }}@{{ vm_addr.stdout | regex_search('(\\d+\\.){3}\\d+') }}"
+              - systemctl is-system-running --wait >/dev/null; /usr/libexec/goose-verify
+          register: goose_verify_result
+          until: goose_verify_result.rc != 255   # 255 = SSH not up yet
+          retries: 24
+          delay: 5
+          changed_when: false
+          failed_when: goose_verify_result.rc not in [0, 2]
+
+        - name: Report goose backend verification
+          when: goose_verify and goose_verify_result is not skipped
+          ansible.builtin.debug:
+            msg: "{{ goose_verify_result.stdout_lines }}"
 
         - name: Show connection details
           ansible.builtin.debug:

@@ -12,12 +12,24 @@ RUN dnf install -y --enablerepo="rhel-10-for-$(arch)-extensions-rpms" \
         {{ pkg }}{% endfor %} && \
     dnf clean all
 
+# Guarantee the image uses the RHEL command-line assistant backend: goose-redhat
+# ships a config selecting the rhel_cla provider, which talks to goose-proxy
+# (socket-activated on 127.0.0.1:7080). Fail the build if any of that changes.
+RUN rpm -q goose-redhat goose-proxy && \
+    grep -qx 'GOOSE_PROVIDER: rhel_cla' /usr/share/goose-redhat/config.yaml && \
+    grep -qx 'GOOSE_MODEL: RHEL-command-line-assistant' /usr/share/goose-redhat/config.yaml && \
+    test -f /usr/share/goose-redhat/rhel_cla.json && \
+    systemctl enable goose-proxy.socket && \
+    systemctl is-enabled goose-proxy.socket
+
 # First-boot Red Hat / Insights registration. No-op unless credentials are
 # supplied at runtime (SMBIOS for KVM, /run/credstore for Podman) - nothing
 # secret is baked into the image.
 COPY goose-register.sh /usr/libexec/goose-register
 COPY goose-register.service /usr/lib/systemd/system/goose-register.service
-RUN chmod 0755 /usr/libexec/goose-register && \
+# Post-deploy check that goose really runs on the CLA backend (used by the playbook).
+COPY goose-verify.sh /usr/libexec/goose-verify
+RUN chmod 0755 /usr/libexec/goose-register /usr/libexec/goose-verify && \
     systemctl enable goose-register.service
 {% if admin_sudo_nopasswd %}
 
