@@ -45,6 +45,12 @@ admin_ssh_pubkey_file: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/id_ed25
 admin_ssh_pubkey: "{{ lookup('ansible.builtin.file', admin_ssh_pubkey_file, errors='ignore') | default('', true) }}"
 admin_sudo_nopasswd: true
 
+# --- Post-deploy verification ---------------------------------------------
+# Run /usr/libexec/goose-verify in the deployed system: checks goose is set to
+# the rhel_cla provider via goose-proxy and, if the system is registered, sends
+# one test prompt to the RHEL command-line assistant backend.
+goose_verify: true
+
 # --- Podman settings ------------------------------------------------------
 podman_privileged: false
 

@@ -8,7 +8,7 @@ This project contains an Ansible playbook that builds and deploys a Red Hat Ente
 * **Two deployment targets:**
   * **Podman:** runs the image as a systemd container managed by a [Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html) unit, so it starts on boot.
   * **KVM:** converts the image to a `qcow2` disk with `bootc-image-builder` and boots it with `virt-install`.
-* **Goose-RedHat:** installs `goose-redhat` from the RHEL 10 extensions repository.
+* **Goose-RedHat on the RHEL command-line assistant backend:** installs `goose-redhat` from the RHEL 10 extensions repository, which preconfigures goose to use Red Hat's command-line assistant inference (provider `rhel_cla`). The build fails if that wiring is missing, and every deploy verifies it end to end.
 * **Optional automatic registration:** registers with Red Hat Subscription Management and Insights on first boot using an activation key. Credentials are passed in at runtime and never baked into the image.
 * **Safe to re-run:** dependencies are installed only for the selected mode. Disks and containers are rebuilt only when the image actually changes. An existing VM is never overwritten unless you ask for it.
 
@@ -93,6 +93,7 @@ Set variables in `vars/goose.yml`, or pass them with `-e`. Both the deploy and t
 | `admin_ssh_pubkey_file` | `~/.ssh/id_ed25519.pub` | Public key for `admin_user` |
 | `admin_sudo_nopasswd` | `true` | Let `wheel` run sudo without a password (the admin user has no password) |
 | `podman_privileged` | `false` | Run the container with `--privileged` |
+| `goose_verify` | `true` | After deploying, verify goose runs on the command-line assistant backend (`rhel_cla`) |
 | `insights_org_id` / `insights_activation_key` | `""` | Enable first-boot registration (set both) |
 
 ## Execution
@@ -135,6 +136,7 @@ To keep the file encrypted at rest, run `ansible-vault encrypt secrets.yml`, the
 2. **Build:** renders the Containerfile and runs `podman build --pull=newer`. It compares image IDs to tell whether anything changed, and pushes to `image_registry` if one is set.
 3. **Podman mode:** installs `/etc/containers/systemd/<vm_name>.container` and starts `<vm_name>.service`. The service restarts only when the unit file or the image changed.
 4. **KVM mode:** generates a qcow2 with `bootc-image-builder`, but only when the image or `config.toml` changed. It then copies the disk to `/var/lib/libvirt/images/<vm_name>.qcow2`, runs `virt-install`, and prints the `ssh` command once the VM gets an IP address.
+5. **Verification** (`goose_verify: true`): after boot it runs `/usr/libexec/goose-verify` in the deployed system, through `podman exec` or over SSH as `admin_user`. See [How goose reaches the backend](#how-goose-reaches-the-backend).
 
 ## Post-Deployment
 
@@ -143,12 +145,13 @@ To keep the file encrypted at rest, run `ansible-vault encrypt secrets.yml`, the
 * **KVM:** use the `ssh goose@<ip>` command printed at the end of the run, or `sudo virsh console goose-admin-node`.
 * **Podman:**
   ```bash
-  sudo podman exec -it goose-admin-node /bin/bash
+  sudo podman exec -it goose-admin-node bash -l
   ```
+  Use a **login shell** (`bash -l`). goose-redhat's per-user setup in `/etc/profile.d/goose-init.sh` only runs in login shells, and without it goose has no provider configured. SSH sessions are login shells already.
 
 ### Register with Red Hat Insights
 
-If you supplied `insights_org_id` and `insights_activation_key`, `goose-register.service` registers the system on first boot. Check it with:
+If you supplied `insights_org_id` and `insights_activation_key`, `goose-register.service` registers the system at boot whenever it isn't registered yet. It checks the actual RHSM and Insights state, so it's safe on every boot. Check it with:
 
 ```bash
 sudo systemctl status goose-register.service
@@ -168,11 +171,28 @@ sudo insights-client --register
 
 ### Start Goose
 
+From a login shell on the node:
+
 ```bash
-goose session
+goose
 ```
 
-Authenticate with your Red Hat credentials if prompted. Run `goose --help` to see the subcommands available in the installed version.
+The session banner should read `rhel_cla RHEL-command-line-assistant`. goose-redhat runs in `approve` mode, so goose asks before it calls any tool. Every response shows Red Hat's notice that interactions may be used to improve Red Hat products, so don't paste personal or sensitive data.
+
+### How goose reaches the backend
+
+```
+goose (~/.config/goose/config.yaml: GOOSE_PROVIDER rhel_cla, GOOSE_MODEL RHEL-command-line-assistant)
+  └─> http://127.0.0.1:7080/v1/chat/completions
+        └─> goose-proxy.socket → goose-proxy.service ──> Red Hat command-line assistant backend
+```
+
+* **Packages:** `goose-redhat` pulls in `goose` and `goose-proxy`. It ships `/usr/share/goose-redhat/config.yaml`, the `rhel_cla.json` custom provider, and `/etc/profile.d/goose-init.sh`. On login, that script copies both files into `~/.config/goose/` for users who don't have them yet. It never overwrites an existing config, so to reset to Red Hat's defaults, delete `~/.config/goose/config.yaml` and log in again.
+* **Proxy:** `goose-proxy` listens on `127.0.0.1:7080` via socket activation; the image enables `goose-proxy.socket` explicitly. Its settings, such as backend timeout and an outbound HTTP proxy, are in `/etc/xdg/goose-proxy/config.toml`.
+* **Registration is required:** the backend authenticates with the system's Red Hat registration (`/etc/pki/consumer/cert.pem`). An unregistered node has a correct config but gets no answers. The deploy's verification reports `SKIP` in that case.
+* **Build-time guard:** the image build fails if `goose-redhat` or `goose-proxy` is missing, if the shipped config stops selecting `rhel_cla` / `RHEL-command-line-assistant`, or if the proxy socket can't be enabled.
+* **Deploy-time check:** `/usr/libexec/goose-verify` runs the login-shell setup, then confirms the config, provider file and proxy socket. If the node is registered, it sends one test prompt and requires the session to start on `rhel_cla RHEL-command-line-assistant`. Exit codes: `0` means verified, `2` means not registered (live test skipped), `1` means failure, which fails the deploy. Run it yourself any time: `/usr/libexec/goose-verify`.
+* **MCP server for RHEL (developer preview):** the shipped config includes a `mcp-server-for-rhel` extension, disabled, pointing at `/usr/bin/linux-mcp-server`. That package isn't installed in this image. Adding it to `extra_packages` and enabling the extension would let goose run diagnostic tools on the node.
 
 ## Maintenance and Updates
 
@@ -181,7 +201,7 @@ In Image Mode, the OS is updated by replacing the image, not by running `dnf upd
 1. Change the image: edit `extra_packages`, `templates/Containerfile.j2` or the base image.
 2. Re-run the playbook. Add `-e build_no_cache=true` to pick up newer RPMs when the Containerfile hasn't changed.
 3. Roll out the update:
-   * **Podman:** handled automatically. The service restarts onto the new image, and `/var` persists in the `<vm_name>-var` volume.
+   * **Podman:** handled automatically. The service restarts onto the new image. `/var` persists in the `<vm_name>-var` volume, and the Red Hat registration (`/etc/pki/consumer`, `/etc/pki/entitlement`) persists in the `<vm_name>-rhsm-consumer` and `<vm_name>-rhsm-entitlement` volumes, so an update keeps the same system identity instead of registering a new one. The container's hostname is fixed to `<vm_name>`.
    * **KVM with `image_registry` set:** the VM tracks the registry image, so update in place from inside the VM:
      ```bash
      sudo bootc upgrade --apply      # pulls the new image and reboots
@@ -202,7 +222,7 @@ ansible-playbook teardown-goose-server.yml -K -e teardown_confirm=yes  # no prom
 In order, it:
 
 1. **Unregisters** from Insights and RHSM, so repeated runs don't leave stale systems in console.redhat.com. For the container it uses `podman exec`. For the VM it uses SSH as `admin_user` with your key. If the VM can't be reached, the run prints a warning instead of failing; remove the system from the [Insights inventory](https://console.redhat.com/insights/inventory) by hand.
-2. **Podman:** stops `<vm_name>.service`, removes the Quadlet file, reloads systemd, then removes the container and the `<vm_name>-var` volume.
+2. **Podman:** stops `<vm_name>.service`, removes the Quadlet file, reloads systemd, then removes the container and its volumes: `<vm_name>-var`, `<vm_name>-rhsm-consumer` and `<vm_name>-rhsm-entitlement`.
 3. **KVM:** stops the VM and runs `virsh undefine --remove-all-storage`, then removes the disk at `/var/lib/libvirt/images/<vm_name>.qcow2`.
 4. **Images:** removes the locally built image tag(s).
 5. **Build directory:** deletes `build_dir`, including the Containerfile, credstore (registration secrets) and qcow2 output.
@@ -228,4 +248,5 @@ ansible-playbook deploy-goose-server.yml   -K -e @secrets.yml
 * **`No match for argument: goose-redhat` / repo errors during the build:** the build can't see RHEL repositories. On RHEL, check `sudo subscription-manager repos --list-enabled`. On other hosts, check the `rhsm_secrets_dir` contents and how old the certificates are.
 * **bootc-image-builder failures:** check free space in `/var/lib/containers` and `build_dir`.
 * **VM gets no IP address:** run `sudo virsh net-list --all` and make sure the network is active. Then use `sudo virsh console <vm_name>` to look at the boot.
+* **`goose-verify`: `... exists but is unreadable (check its SELinux label ...)`:** a file in the persistent `/var` volume still carries an old container's SELinux label. goose-init.sh copies its config with `cp -pa`, which preserves labels, and each new container gets new MCS categories (SELinux tags that keep containers from reading each other's files). The Quadlet unit mounts the volume with `:Z` so Podman relabels it on every start. If you see this, re-run the deploy so the updated unit is installed.
 * **Container won't start:** run `sudo systemctl status goose-admin-node.service` and `sudo journalctl -u goose-admin-node.service`. To validate the unit, run `sudo /usr/libexec/podman/quadlet -dryrun`.

@@ -102,15 +102,18 @@
       ansible.builtin.command: podman rm --force --ignore {{ vm_name }}
       changed_when: true
 
-    - name: Check for the persistent /var volume
-      ansible.builtin.command: podman volume exists {{ vm_name }}-var
-      register: var_volume
+    - name: Check for the persistent volumes (/var and RHSM identity)
+      ansible.builtin.command: podman volume exists {{ vm_name }}-{{ item }}
+      loop: [var, rhsm-consumer, rhsm-entitlement]
+      register: node_volumes
       changed_when: false
-      failed_when: var_volume.rc not in [0, 1]
+      failed_when: node_volumes.rc not in [0, 1]
 
-    - name: Remove the persistent /var volume
-      when: var_volume.rc == 0
-      ansible.builtin.command: podman volume rm --force {{ vm_name }}-var
+    - name: Remove the persistent volumes
+      ansible.builtin.command: podman volume rm --force {{ vm_name }}-{{ item.item }}
+      loop: "{{ node_volumes.results | selectattr('rc', 'eq', 0) | list }}"
+      loop_control:
+        label: "{{ vm_name }}-{{ item.item }}"
       changed_when: true
 
     # ------------------------------------------------------------------ kvm

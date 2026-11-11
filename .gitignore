@@ -1,3 +1,4 @@
 # Local credentials / machine-specific settings
 secrets.yml
 *.secrets.yml
+ansible-navigator.log
