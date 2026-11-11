@@ -265,3 +265,40 @@
       ansible.builtin.file:
         path: "{{ build_dir }}"
         state: absent
+
+    # ---------------------------------------------------------- next steps
+    - name: Check for a kept image-builder identity
+      ansible.builtin.stat:
+        path: "{{ rhsm_builder_dir }}/state/consumer/cert.pem"
+      register: builder_left
+      failed_when: false   # summary only; never fail the teardown over it
+
+    - name: Check how secrets.yml should be passed (for the printed commands)
+      ansible.builtin.command: head -c 14 {{ playbook_dir }}/secrets.yml
+      register: secrets_head
+      changed_when: false
+      failed_when: false
+
+    - name: Next steps - verify, stand back up
+      ansible.builtin.debug:
+        msg: "{{ td_lines + ([builder_line] if (builder_left.stat.exists | default(false)) else []) + cli_lines }}"
+      vars:
+        secrets_args: >-
+          {{ (' -e @secrets.yml' if secrets_head.rc == 0 else '')
+             ~ (' --ask-vault-pass' if secrets_head.stdout is search('ANSIBLE_VAULT') else '') }}
+        deploy_cmd: "cd {{ playbook_dir }} && ansible-playbook deploy-goose-server.yml -K{{ secrets_args }}"
+        teardown_cmd: "cd {{ playbook_dir }} && ansible-playbook teardown-goose-server.yml -K{{ secrets_args }}"
+        builder_line: >-
+          KEPT: image-builder identity '{{ rhsm_builder_name }}' in {{ rhsm_builder_dir }}
+          (reused by the next deploy; remove with -e teardown_remove_builder=true)
+        kept_images: "{{ ', base images' if not (teardown_remove_base_images | bool) else '' }}"
+        td_lines:
+          - "TEARDOWN COMPLETE for {{ vm_name }}. Check nothing is left:"
+          - "  sudo podman ps -a --filter name={{ vm_name }}; sudo podman volume ls --filter name={{ vm_name }}"
+          - "  sudo virsh list --all | grep {{ vm_name }}"
+          - "KEPT on purpose: packages, libvirt setup, registry login, secrets.yml{{ kept_images }}"
+        cli_lines:
+          - "STAND UP AGAIN:"
+          - "  {{ deploy_cmd }}                  # add -e deployment_mode=kvm for a VM"
+          - "NEW MACHINE? Prepare it first:"
+          - "  cd {{ playbook_dir }} && ./bootstrap.sh"

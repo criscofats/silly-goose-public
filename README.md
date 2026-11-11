@@ -194,6 +194,7 @@ To keep the file encrypted at rest, run `ansible-vault encrypt secrets.yml`, the
 3. **Podman mode:** installs `/etc/containers/systemd/<vm_name>.container` and starts `<vm_name>.service`. The service restarts only when the unit file or the image changed.
 4. **KVM mode:** generates a qcow2 with `bootc-image-builder`, but only when the image or `config.toml` changed. It then copies the disk to `/var/lib/libvirt/images/<vm_name>.qcow2`, runs `virt-install`, and prints the `ssh` command once the VM gets an IP address.
 5. **Verification** (`goose_verify: true`): after boot it runs `/usr/libexec/goose-verify` in the deployed system, through `podman exec` or over SSH as `admin_user`. See [How goose reaches the backend](#how-goose-reaches-the-backend).
+6. **Next steps:** the run ends by printing how to connect to the node (`podman exec ... bash -l`, or `ssh`/`virsh console` with the VM's IP) and the exact command lines to update, tear down or run a full teardown→deploy cycle. Those commands include `-e @secrets.yml` and `--ask-vault-pass` when they apply. Teardown likewise ends with checks that nothing is left, a note on what was deliberately kept, and the command to stand the node up again.
 
 ## Post-Deployment
 
