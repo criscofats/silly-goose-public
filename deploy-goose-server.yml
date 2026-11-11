@@ -502,9 +502,52 @@
           ansible.builtin.debug:
             msg: "{{ goose_verify_result.stdout_lines }}"
 
-        - name: Show connection details
-          ansible.builtin.debug:
-            msg: >-
-              {{ ('ssh ' ~ admin_user ~ '@' ~ (vm_addr.stdout | regex_search('(\d+\.){3}\d+')))
-                 if vm_addr.stdout is search('ipv4')
-                 else 'No IP yet; try: sudo virsh domifaddr ' ~ vm_name ~ ' or sudo virsh console ' ~ vm_name }}
+
+    - name: Check how secrets.yml should be passed (for the printed commands)
+      ansible.builtin.command: head -c 14 {{ playbook_dir }}/secrets.yml
+      register: secrets_head
+      changed_when: false
+      failed_when: false
+
+    - name: Next steps - connect, stand up, tear down
+      ansible.builtin.debug:
+        msg: "{{ (podman_lines if deployment_mode == 'podman' else kvm_lines) + cli_lines }}"
+      vars:
+        secrets_args: >-
+          {{ (' -e @secrets.yml' if secrets_head.rc == 0 else '')
+             ~ (' --ask-vault-pass' if secrets_head.stdout is search('ANSIBLE_VAULT') else '') }}
+        deploy_cmd: "cd {{ playbook_dir }} && ansible-playbook deploy-goose-server.yml -K{{ secrets_args }}"
+        teardown_cmd: "cd {{ playbook_dir }} && ansible-playbook teardown-goose-server.yml -K{{ secrets_args }}"
+        vm_ip: "{{ ((vm_addr | default({})).stdout | default('')) | regex_search('(\\d+\\.){3}\\d+') | default('', true) }}"
+        mode_arg: "{{ '' if deployment_mode == 'podman' else ' -e deployment_mode=' ~ deployment_mode }}"
+        ssh_line: >-
+          {{ ('  ssh ' ~ admin_user ~ '@' ~ vm_ip) if vm_ip
+             else ('  sudo virsh domifaddr ' ~ vm_name ~ '    # find the IP, then: ssh ' ~ admin_user ~ '@<ip>') }}
+        update_line: >-
+          {{ '  sudo bootc upgrade --apply                     # inside the VM: update to the newest pushed image'
+             if image_registry
+             else '  update: re-run the deploy with -e vm_recreate=true (rebuilds the VM; /var is lost)' }}
+        podman_lines:
+          - "CONNECT (Podman container {{ vm_name }}):"
+          - "  sudo podman exec -it {{ vm_name }} bash -l    # use a login shell - it sets up goose's config"
+          - "  goose                                          # start a session (provider rhel_cla)"
+          - "CHECK / MANAGE:"
+          - "  sudo podman exec {{ vm_name }} /usr/libexec/goose-verify    # re-check the goose backend"
+          - "  sudo systemctl status {{ vm_name }}.service     # restart | stop | start"
+          - "  sudo journalctl -u {{ vm_name }}.service"
+        kvm_lines:
+          - "CONNECT (KVM VM {{ vm_name }}):"
+          - "{{ ssh_line }}"
+          - "  sudo virsh console {{ vm_name }}                # serial console; Ctrl+] to exit"
+          - "  goose                                          # once logged in: start a session (provider rhel_cla)"
+          - "CHECK / MANAGE:"
+          - "  /usr/libexec/goose-verify                      # inside the VM: re-check the goose backend"
+          - "  sudo virsh dominfo {{ vm_name }}                # shutdown | start | reboot"
+          - "{{ update_line }}"
+        cli_lines:
+          - "STAND UP / UPDATE (safe to re-run; only changed parts are rebuilt):"
+          - "  {{ deploy_cmd }}{{ mode_arg }}"
+          - "TEAR DOWN (removes container/VM, volumes, local image, build dir; asks to confirm):"
+          - "  {{ teardown_cmd }}                          # add -e teardown_confirm=yes to skip the prompt"
+          - "FULL CYCLE:"
+          - "  {{ teardown_cmd }} -e teardown_confirm=yes && ansible-playbook deploy-goose-server.yml -K{{ secrets_args }}{{ mode_arg }}"
