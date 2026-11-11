@@ -68,8 +68,94 @@
           {{ (rh_registry_login.results | selectattr('rc', 'eq', 0) | first).stdout }}
           via {{ registry_authfile_found or "root's default auth file" }}
 
+    - name: Generate build entitlement from your Red Hat account (rhsm_builder_register)
+      when: rhsm_builder_register | bool
+      block:
+        - name: Validate builder settings
+          ansible.builtin.assert:
+            that:
+              - rhsm_secrets_dir | length == 0
+              - (rhsm_builder_org_id | length > 0 and rhsm_builder_activation_key | length > 0)
+                or (rhsm_builder_username | length > 0 and rhsm_builder_password | length > 0)
+              - rhsm_builder_dir is match('^/.+/.+')
+            fail_msg: >-
+              rhsm_builder_register needs rhsm_secrets_dir left empty, a builder
+              directory below the top level, and either rhsm_builder_org_id +
+              rhsm_builder_activation_key (default: the insights_* values) or
+              rhsm_builder_username + rhsm_builder_password.
+
+        - name: Ensure builder state directories exist
+          ansible.builtin.file:
+            path: "{{ rhsm_builder_dir }}/{{ item }}"
+            state: directory
+            mode: "0700"
+          loop: ["", state/consumer, state/entitlement, state/lib, secrets]
+
+        - name: Install the builder script
+          ansible.builtin.copy:
+            src: files/rhsm-builder.sh
+            dest: "{{ rhsm_builder_dir }}/rhsm-builder.sh"
+            mode: "0755"
+
+        - name: Create a temporary credentials directory
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: goose-builder-creds
+          register: builder_creds
+
+        - name: Register (once) and export the build entitlement
+          block:
+            - name: Write builder credentials
+              ansible.builtin.copy:
+                dest: "{{ builder_creds.path }}/{{ item.name }}"
+                content: "{{ item.value }}"
+                mode: "0600"
+              loop:
+                - { name: system_name, value: "{{ rhsm_builder_name }}" }
+                - { name: org_id, value: "{{ rhsm_builder_org_id }}" }
+                - { name: activation_key, value: "{{ rhsm_builder_activation_key }}" }
+                - { name: username, value: "{{ rhsm_builder_username }}" }
+                - { name: password, value: "{{ rhsm_builder_password }}" }
+              loop_control:
+                label: "{{ item.name }}"
+              no_log: true
+
+            - name: Run the builder container
+              ansible.builtin.command:
+                argv:
+                  - podman
+                  - run
+                  - --rm
+                  - --hostname
+                  - "{{ rhsm_builder_name }}"
+                  - -v
+                  - "{{ rhsm_builder_dir }}/state/consumer:/etc/pki/consumer:Z"
+                  - -v
+                  - "{{ rhsm_builder_dir }}/state/entitlement:/etc/pki/entitlement:Z"
+                  - -v
+                  - "{{ rhsm_builder_dir }}/state/lib:/var/lib/rhsm:Z"
+                  - -v
+                  - "{{ rhsm_builder_dir }}/secrets:/out:Z"
+                  - -v
+                  - "{{ rhsm_builder_dir }}/rhsm-builder.sh:/usr/local/bin/rhsm-builder:ro,Z"
+                  - -v
+                  - "{{ builder_creds.path }}:/run/goose-builder-creds:ro,Z"
+                  - "{{ base_image }}"
+                  - /usr/local/bin/rhsm-builder
+              register: builder_run
+              changed_when: "'registered new build identity' in builder_run.stdout"
+
+            - name: Report builder result
+              ansible.builtin.debug:
+                msg: "{{ builder_run.stdout_lines | select('match', '^builder:') | list }}"
+          always:
+            - name: Remove temporary credentials
+              ansible.builtin.file:
+                path: "{{ builder_creds.path }}"
+                state: absent
+
     - name: Check RHEL host subscription (entitlement passthrough to builds)
-      when: ansible_facts['distribution'] == 'RedHat' and not rhsm_secrets_dir
+      when: ansible_facts['distribution'] == 'RedHat' and not rhsm_secrets_dir_effective
       ansible.builtin.command: subscription-manager identity
       register: rhsm_identity
       changed_when: false
@@ -78,18 +164,19 @@
     - name: Require rhsm_secrets_dir on non-RHEL build hosts
       when: ansible_facts['distribution'] != 'RedHat'
       ansible.builtin.assert:
-        that: rhsm_secrets_dir | length > 0
+        that: rhsm_secrets_dir_effective | length > 0
         fail_msg: >-
           This host is {{ ansible_facts['distribution'] }}, which can't pass RHEL
           entitlements into container builds automatically. Set
-          rhsm_secrets_dir (see README: "Building on a non-RHEL host").
+          rhsm_secrets_dir, or rhsm_builder_register=true to fetch entitlement
+          with your Red Hat account (see README: "Building on a non-RHEL host").
 
     - name: Validate rhsm_secrets_dir layout
-      when: rhsm_secrets_dir | length > 0
+      when: rhsm_secrets_dir_effective | length > 0
       block:
         - name: Inspect rhsm_secrets_dir contents
           ansible.builtin.stat:
-            path: "{{ rhsm_secrets_dir }}/{{ item }}"
+            path: "{{ rhsm_secrets_dir_effective }}/{{ item }}"
           loop: [etc-pki-entitlement, rhsm, redhat.repo]
           register: rhsm_secrets_stat
 
@@ -97,7 +184,7 @@
           ansible.builtin.assert:
             that: rhsm_secrets_stat.results | rejectattr('stat.exists') | list | length == 0
             fail_msg: >-
-              {{ rhsm_secrets_dir }} must contain etc-pki-entitlement/, rhsm/
+              {{ rhsm_secrets_dir_effective }} must contain etc-pki-entitlement/, rhsm/
               and redhat.repo. Missing:
               {{ rhsm_secrets_stat.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}
 
@@ -165,7 +252,7 @@
         argv: >-
           {{ ['podman', 'build', '--pull=newer']
              + (['--no-cache'] if build_no_cache else [])
-             + (['-v', rhsm_secrets_dir ~ ':/run/secrets:ro,z'] if rhsm_secrets_dir else [])
+             + (['-v', rhsm_secrets_dir_effective ~ ':/run/secrets:ro,z'] if rhsm_secrets_dir_effective else [])
              + ['-t', image_ref, '-f', 'Containerfile', '.'] }}
         chdir: "{{ build_dir }}"
       changed_when: false

@@ -32,6 +32,20 @@ registry_authfile: ""
 #   redhat.repo           (/etc/yum.repos.d/redhat.repo)
 rhsm_secrets_dir: ""
 
+# --- Alternative: build entitlement from your Red Hat account ----------------
+# Instead of copying entitlement files from a registered RHEL system, let the
+# playbook register a persistent "image builder" identity (in a short-lived
+# rhel-bootc container) and export its entitlement for the build. Use either an
+# activation key + org ID (defaults to the insights_* values) or a Red Hat
+# username + password. Set rhsm_secrets_dir OR this, not both.
+rhsm_builder_register: false
+rhsm_builder_dir: "/var/lib/goose-image-builder"   # identity + exported secrets (root-only)
+rhsm_builder_name: "goose-image-builder"           # system name shown in your Red Hat account
+rhsm_builder_org_id: "{{ insights_org_id }}"
+rhsm_builder_activation_key: "{{ insights_activation_key }}"
+rhsm_builder_username: ""
+rhsm_builder_password: ""
+
 # --- KVM settings ---------------------------------------------------------
 vm_memory: 4096
 vm_vcpus: 2
@@ -63,6 +77,7 @@ insights_activation_key: ""
 image_ref: "{{ (image_registry ~ ':' ~ image_tag) if image_registry else ('localhost/' ~ image_name ~ ':' ~ image_tag) }}"
 registration_enabled: "{{ (insights_org_id | length > 0) and (insights_activation_key | length > 0) }}"
 credstore_dir: "{{ build_dir }}/credstore"
+rhsm_secrets_dir_effective: "{{ (rhsm_builder_dir ~ '/secrets') if (rhsm_builder_register | bool) else rhsm_secrets_dir }}"
 vm_disk_path: "{{ libvirt_image_dir }}/{{ vm_name }}.qcow2"
 kvm_packages:
   - libvirt

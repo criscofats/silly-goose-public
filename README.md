@@ -37,7 +37,7 @@ The playbook installs everything else for you (`podman`, plus `libvirt`, `virt-i
    The playbook runs Podman as root. It uses root's own login if there is one. Otherwise it falls back to your user's auth files (`$XDG_RUNTIME_DIR/containers/auth.json`, `~/.config/containers/auth.json`, `~/.docker/config.json`) and passes the one that works to every Podman command through `REGISTRY_AUTH_FILE`. To use a specific file, set `registry_authfile`.
 3. **RHEL content entitlement for the image build:** the build has to install packages from RHEL repositories.
    * **Registered RHEL host:** nothing to do. Podman passes the host's entitlement into the build automatically.
-   * **Any other host (Fedora, etc.):** see [Building on a non-RHEL host](#building-on-a-non-rhel-host).
+   * **Any other host (Fedora, etc.):** see [Building on a non-RHEL host](#building-on-a-non-rhel-host). Either copy entitlement files from a registered RHEL system (`rhsm_secrets_dir`), or let the playbook fetch them with your Red Hat account (`rhsm_builder_register`).
 4. **SSH key (KVM mode only):** by default the playbook reads `~/.ssh/id_ed25519.pub` and adds it for the `goose` admin user. Override this with `admin_ssh_pubkey_file` or `admin_ssh_pubkey`.
 
 ### Building on a non-RHEL host
@@ -69,6 +69,33 @@ sudo chmod -R go-rwx /etc/goose/rhsm-secrets
 
 Copy real files rather than symlinks, because the directory is bind-mounted into the build container. Entitlement certificates expire, so refresh them if the build starts failing with 403 errors from the CDN.
 
+#### Alternative: fetch entitlement with your Red Hat account (no copying)
+
+If you have a Red Hat account with subscriptions, the playbook can create the entitlement directory itself, with no RHEL system and no `rhsm-secrets.tgz` to copy. Set `rhsm_builder_register: true` and leave `rhsm_secrets_dir` empty. Each deploy then does the following before the build:
+
+1. Runs a short-lived container from the same `rhel-bootc` base image, named `goose-image-builder`.
+2. Registers it with Red Hat **once**. Its identity is kept in `rhsm_builder_dir` (`/var/lib/goose-image-builder`, root-only), so later runs reuse the same registered system instead of creating new ones.
+3. Refreshes its certificates on every run, so expiry isn't a concern while you keep deploying.
+4. Checks that your entitlement actually provides `goose-redhat` from `rhel-10-for-$(arch)-extensions-rpms`. If it doesn't, the run fails with a clear message.
+5. Exports `etc-pki-entitlement/`, `rhsm/` and `redhat.repo` to `rhsm_builder_dir/secrets`. The build mounts that exactly as it would a hand-made `rhsm_secrets_dir`.
+
+Credentials, in `secrets.yml`. Use **one** of these:
+
+```yaml
+rhsm_builder_register: true
+# a) activation key + org ID: defaults to insights_org_id / insights_activation_key,
+#    so if those are already set there's nothing else to add
+# b) Red Hat login (add rhsm_builder_org_id if your account belongs to several orgs):
+rhsm_builder_username: "you@example.com"
+rhsm_builder_password: "..."
+```
+
+An activation key is the better choice. You can create one at [console.redhat.com → Activation keys](https://console.redhat.com/insights/connector/activation-keys) and revoke it without touching your password. Credentials are written to a temporary root-only directory for the registration and deleted straight afterwards, even if the run fails. Ansible never logs them.
+
+The builder shows up in your Red Hat account as one system, `goose-image-builder` (set by `rhsm_builder_name`). Teardown leaves it alone so repeated cycles reuse it. To unregister and delete it, run teardown with `-e teardown_remove_builder=true`.
+
+*About the ISOs:* this workflow doesn't need them. Image mode builds the OS from the `rhel-bootc` container image, and bootc-image-builder turns that into a VM disk. Your subscription access, via the registry login and the entitlement above, is all the build uses.
+
 ## Configuration
 
 Set variables in `vars/goose.yml`, or pass them with `-e`. Both the deploy and teardown playbooks load this file, so they always agree on names and paths. If you override `vm_name`, `image_name`, `build_dir` and so on with `-e` when deploying, pass the same overrides to teardown.
@@ -82,6 +109,10 @@ Set variables in `vars/goose.yml`, or pass them with `-e`. Both the deploy and t
 | `extra_packages` | `[]` | Extra RPMs to add to the image, e.g. `[tcpdump, sysstat]` |
 | `build_no_cache` | `false` | Rebuild every layer so newer RPMs are picked up |
 | `rhsm_secrets_dir` | `""` | Entitlement directory for non-RHEL build hosts |
+| `rhsm_builder_register` | `false` | Fetch build entitlement with your Red Hat account instead of `rhsm_secrets_dir` |
+| `rhsm_builder_dir` / `rhsm_builder_name` | `/var/lib/goose-image-builder` / `goose-image-builder` | Builder identity and exported entitlement; system name in your account |
+| `rhsm_builder_org_id` / `rhsm_builder_activation_key` | `insights_org_id` / `insights_activation_key` | Builder activation-key credentials |
+| `rhsm_builder_username` / `rhsm_builder_password` | `""` | Alternative: Red Hat login for the builder |
 | `build_dir` | `/opt/goose-image-build` | Build context and bootc-image-builder output |
 | `registry_authfile` | `""` | Registry auth file to use (empty = auto-detect) |
 | `vm_memory` / `vm_vcpus` | `4096` / `2` | VM sizing |
@@ -232,8 +263,9 @@ In order, it:
 | `teardown_confirm` | prompt | Set to `yes` to skip the confirmation prompt |
 | `teardown_unregister` | `true` | Unregister from RHSM/Insights before destroying |
 | `teardown_remove_base_images` | `false` | Also delete the base image and the bootc-image-builder image (forces a full re-pull) |
+| `teardown_remove_builder` | `false` | Unregister the `rhsm_builder_register` builder system from Red Hat and delete `rhsm_builder_dir` |
 
-These are **left in place** on purpose, so the next deploy is fast and doesn't need setting up again: installed packages, the libvirt daemons and network, registry logins, `rhsm_secrets_dir`, and any image pushed to `image_registry`.
+These are **left in place** on purpose, so the next deploy is fast and doesn't need setting up again: installed packages, the libvirt daemons and network, registry logins, `rhsm_secrets_dir`, the `rhsm_builder_register` builder identity (unless `teardown_remove_builder=true`), and any image pushed to `image_registry`.
 
 ### Repeatable test cycle
 
