@@ -4,7 +4,8 @@
 # part of it) is deployed.
 #
 # Left in place on purpose: installed packages, libvirt daemons/network,
-# registry logins, rhsm_secrets_dir, and any image pushed to image_registry.
+# registry logins, rhsm_secrets_dir, any image pushed to image_registry, and
+# the rhsm_builder_register identity (unless teardown_remove_builder=true).
 - name: Tear down RHEL 10 Image Mode Server with Goose-RedHat
   hosts: localhost
   connection: local
@@ -21,6 +22,10 @@
     # Also delete the base and builder images pulled from registry.redhat.io
     # (forces a full re-pull on the next deploy).
     teardown_remove_base_images: false
+    # Also unregister and delete the persistent image-builder identity created
+    # by rhsm_builder_register (rhsm_builder_dir). Off by default so repeated
+    # cycles reuse one registered builder system.
+    teardown_remove_builder: false
     quadlet_path: "/etc/containers/systemd/{{ vm_name }}.container"
 
   vars_prompt:
@@ -206,6 +211,54 @@
         - "{{ builder_image }}"
       register: base_rm
       changed_when: base_rm.stdout | length > 0
+
+    # ------------------------------------------------- image-builder identity
+    - name: Remove the image-builder identity (teardown_remove_builder)
+      when: teardown_remove_builder | bool
+      block:
+        - name: Refuse to delete a dangerous rhsm_builder_dir
+          ansible.builtin.assert:
+            that:
+              - rhsm_builder_dir is match('^/.+/.+')
+              - rhsm_builder_dir | regex_replace('/+$', '') not in ['/opt', '/var', '/var/lib', '/etc', '/usr', '/home', '/root', '/srv', '/tmp']
+            fail_msg: "Refusing to remove rhsm_builder_dir={{ rhsm_builder_dir }}"
+
+        - name: Check for builder identity
+          ansible.builtin.stat:
+            path: "{{ rhsm_builder_dir }}/state/consumer/cert.pem"
+          register: builder_cert
+
+        - name: Unregister the image-builder system from Red Hat
+          when: builder_cert.stat.exists
+          ansible.builtin.command:
+            argv:
+              - podman
+              - run
+              - --rm
+              - -v
+              - "{{ rhsm_builder_dir }}/state/consumer:/etc/pki/consumer:Z"
+              - -v
+              - "{{ rhsm_builder_dir }}/state/entitlement:/etc/pki/entitlement:Z"
+              - -v
+              - "{{ rhsm_builder_dir }}/state/lib:/var/lib/rhsm:Z"
+              - "{{ base_image }}"
+              - subscription-manager
+              - unregister
+          register: builder_unregister
+          changed_when: builder_unregister.rc == 0
+          failed_when: false
+
+        - name: Warn if the builder could not be unregistered
+          when: builder_cert.stat.exists and builder_unregister.rc != 0
+          ansible.builtin.debug:
+            msg: >-
+              Could not unregister {{ rhsm_builder_name }}; remove it manually at
+              https://console.redhat.com/insights/inventory
+
+        - name: Delete the builder directory
+          ansible.builtin.file:
+            path: "{{ rhsm_builder_dir }}"
+            state: absent
 
     # ------------------------------------------------------------ build dir
     - name: Remove the build directory (Containerfile, credstore, qcow2 output)
