@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+# Quadlet unit: generates {{ vm_name }}.service, starts on boot.
+
+[Unit]
+Description=Goose RHEL 10 Image Mode troubleshooting node
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName={{ vm_name }}
+Image={{ image_ref }}
+Exec=/sbin/init
+# Persist /var (home dirs, /root, goose session history) across image updates,
+# matching bootc semantics on a real host.
+Volume={{ vm_name }}-var:/var
+{% if registration_enabled %}
+Volume={{ credstore_dir }}:/run/credstore:ro,Z
+{% endif %}
+PodmanArgs=--systemd=always{% if podman_privileged %} --privileged{% endif %}
+
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

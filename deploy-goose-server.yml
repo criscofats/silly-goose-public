@@ -1,92 +1,372 @@
 ---
 - name: Deploy RHEL 10 Image Mode Server with Goose-RedHat
   hosts: localhost
+  connection: local
   become: true
-  vars:
-    image_name: "goose-rhel10-troubleshooter"
-    # Set to 'kvm' to provision a libvirt VM, or 'podman' to run as a local container
-    deployment_mode: "kvm" 
-    base_image: "registry.redhat.io/rhel10/rhel-bootc:latest"
-    build_dir: "/opt/goose-image-build"
-    vm_name: "goose-admin-node"
-    
+  gather_facts: true
+  # Point every root podman command at the registry credentials found in pre_tasks.
+  environment: "{{ {'REGISTRY_AUTH_FILE': registry_authfile_found} if (registry_authfile_found | default('')) else {} }}"
+
+  vars_files:
+    - vars/goose.yml
+
   pre_tasks:
-    - name: Ensure required deployment dependencies are installed
+    - name: Validate configuration
+      ansible.builtin.assert:
+        that:
+          - deployment_mode in ['kvm', 'podman']
+          - (insights_org_id | length > 0) == (insights_activation_key | length > 0)
+        fail_msg: >-
+          deployment_mode must be 'kvm' or 'podman', and insights_org_id /
+          insights_activation_key must be set together (or both left empty).
+
+    - name: Require an SSH public key for the KVM admin user
+      when: deployment_mode == 'kvm'
+      ansible.builtin.assert:
+        that: admin_ssh_pubkey | length > 0
+        fail_msg: >-
+          No SSH public key found at {{ admin_ssh_pubkey_file }}. Set
+          admin_ssh_pubkey_file or admin_ssh_pubkey, otherwise the VM will have
+          no usable login.
+
+    - name: Ensure deployment dependencies are installed
       ansible.builtin.package:
-        name:
-          - podman
-          - libvirt
-          - virt-install
-          - qemu-kvm
+        name: "{{ ['podman'] + (kvm_packages if deployment_mode == 'kvm' else []) }}"
         state: present
 
-    - name: Ensure libvirtd service is running and enabled (KVM mode only)
+    - name: Check registry.redhat.io credentials (root login, then user auth files)
+      ansible.builtin.command:
+        argv: "{{ ['podman', 'login', '--get-login'] + (['--authfile', item] if item else []) + ['registry.redhat.io'] }}"
+      loop: >-
+        {{ [registry_authfile] if registry_authfile else
+           [''] + ([lookup('ansible.builtin.env', 'XDG_RUNTIME_DIR') ~ '/containers/auth.json',
+                    lookup('ansible.builtin.env', 'HOME') ~ '/.config/containers/auth.json',
+                    lookup('ansible.builtin.env', 'HOME') ~ '/.docker/config.json'] | select('file') | list) }}
+      loop_control:
+        label: "{{ item or 'root default' }}"
+      register: rh_registry_login
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if no credentials for registry.redhat.io were found
+      when: rh_registry_login.results | selectattr('rc', 'eq', 0) | list | length == 0
+      ansible.builtin.fail:
+        msg: >-
+          No working registry.redhat.io login found. Run
+          `podman login registry.redhat.io` (or set registry_authfile).
+          podman said:
+          {{ rh_registry_login.results | map(attribute='stderr') | map('trim') | unique | join(' | ') }}
+
+    - name: Use the first working registry credentials
+      ansible.builtin.set_fact:
+        registry_authfile_found: "{{ (rh_registry_login.results | selectattr('rc', 'eq', 0) | first).item }}"
+
+    - name: Report registry credentials in use
+      ansible.builtin.debug:
+        msg: >-
+          registry.redhat.io: logged in as
+          {{ (rh_registry_login.results | selectattr('rc', 'eq', 0) | first).stdout }}
+          via {{ registry_authfile_found or "root's default auth file" }}
+
+    - name: Check RHEL host subscription (entitlement passthrough to builds)
+      when: ansible_facts['distribution'] == 'RedHat' and not rhsm_secrets_dir
+      ansible.builtin.command: subscription-manager identity
+      register: rhsm_identity
+      changed_when: false
+      failed_when: rhsm_identity.rc != 0
+
+    - name: Require rhsm_secrets_dir on non-RHEL build hosts
+      when: ansible_facts['distribution'] != 'RedHat'
+      ansible.builtin.assert:
+        that: rhsm_secrets_dir | length > 0
+        fail_msg: >-
+          This host is {{ ansible_facts['distribution'] }}, which can't pass RHEL
+          entitlements into container builds automatically. Set
+          rhsm_secrets_dir (see README: "Building on a non-RHEL host").
+
+    - name: Validate rhsm_secrets_dir layout
+      when: rhsm_secrets_dir | length > 0
+      block:
+        - name: Inspect rhsm_secrets_dir contents
+          ansible.builtin.stat:
+            path: "{{ rhsm_secrets_dir }}/{{ item }}"
+          loop: [etc-pki-entitlement, rhsm, redhat.repo]
+          register: rhsm_secrets_stat
+
+        - name: Fail if rhsm_secrets_dir is incomplete
+          ansible.builtin.assert:
+            that: rhsm_secrets_stat.results | rejectattr('stat.exists') | list | length == 0
+            fail_msg: >-
+              {{ rhsm_secrets_dir }} must contain etc-pki-entitlement/, rhsm/
+              and redhat.repo. Missing:
+              {{ rhsm_secrets_stat.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}
+
+    - name: Ensure modular libvirt daemons are enabled and running (KVM mode)
       when: deployment_mode == 'kvm'
-      ansible.builtin.service:
-        name: libvirtd
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
         state: started
         enabled: true
+      loop:
+        - virtqemud.socket
+        - virtnetworkd.socket
+        - virtstoraged.socket
+
+    - name: Ensure libvirt network is active and autostarted (KVM mode)
+      when: deployment_mode == 'kvm'
+      block:
+        - name: Inspect libvirt network
+          ansible.builtin.command: virsh net-info {{ vm_network }}
+          register: net_info
+          changed_when: false
+
+        - name: Start libvirt network
+          when: net_info.stdout is not search('Active:\s+yes')
+          ansible.builtin.command: virsh net-start {{ vm_network }}
+          changed_when: true
+
+        - name: Autostart libvirt network
+          when: net_info.stdout is not search('Autostart:\s+yes')
+          ansible.builtin.command: virsh net-autostart {{ vm_network }}
+          changed_when: true
 
   tasks:
+    # ------------------------------------------------------------------ build
     - name: Ensure build directory exists
       ansible.builtin.file:
         path: "{{ build_dir }}"
         state: directory
-        mode: '0755'
+        mode: "0755"
 
-    - name: Create RHEL 10 bootc Containerfile
-      ansible.builtin.copy:
+    - name: Render Containerfile
+      ansible.builtin.template:
+        src: templates/Containerfile.j2
         dest: "{{ build_dir }}/Containerfile"
-        content: |
-          FROM {{ base_image }}
+        mode: "0644"
 
-          # Enable the RHEL 10 extensions repository for goose-redhat
-          RUN subscription-manager repos --enable rhel-10-for-$(arch)-extensions-rpms && \
-              dnf install -y goose-redhat insights-client && \
-              dnf clean all
+    - name: Copy first-boot registration unit and script into build context
+      ansible.builtin.copy:
+        src: "files/{{ item }}"
+        dest: "{{ build_dir }}/{{ item }}"
+        mode: "0644"
+      loop:
+        - goose-register.service
+        - goose-register.sh
 
-          # Enable Insights client to run on boot
-          RUN systemctl enable insights-clientd.service
-          
-          # Optional: Pre-configure SSH keys or users here if bypassing cloud-init
+    - name: Record current image ID (if any)
+      ansible.builtin.command: podman image inspect {{ image_ref }}
+      register: image_before
+      changed_when: false
+      failed_when: false
 
-    - name: Build the RHEL 10 bootc image using Podman
+    - name: Build the bootc image
       ansible.builtin.command:
-        cmd: podman build -t localhost/{{ image_name }}:latest -f Containerfile .
+        argv: >-
+          {{ ['podman', 'build', '--pull=newer']
+             + (['--no-cache'] if build_no_cache else [])
+             + (['-v', rhsm_secrets_dir ~ ':/run/secrets:ro,z'] if rhsm_secrets_dir else [])
+             + ['-t', image_ref, '-f', 'Containerfile', '.'] }}
         chdir: "{{ build_dir }}"
-      changed_when: true
+      changed_when: false
 
-    - name: Run directly in Podman (Image Mode Container)
+    - name: Read new image ID
+      ansible.builtin.command: podman image inspect {{ image_ref }}
+      register: image_after
+      changed_when: false
+
+    - name: Determine whether the image changed
+      ansible.builtin.set_fact:
+        image_id: "{{ (image_after.stdout | from_json)[0].Id }}"
+        image_changed: >-
+          {{ image_before.rc != 0 or
+             (image_before.stdout | from_json)[0].Id != (image_after.stdout | from_json)[0].Id }}
+
+    - name: Report image build result
+      ansible.builtin.debug:
+        msg: "{{ image_ref }} -> {{ image_id[:12] }} ({{ 'rebuilt' if image_changed else 'unchanged' }})"
+      changed_when: image_changed
+
+    - name: Push image to registry
+      when: image_registry | length > 0
+      ansible.builtin.command: podman push {{ image_ref }}
+      changed_when: image_changed
+
+    # ----------------------------------------------------------------- podman
+    - name: Podman deployment
       when: deployment_mode == 'podman'
-      ansible.builtin.command:
-        cmd: >
-          podman run -d --name {{ vm_name }}
-          --privileged
-          -v /sys/fs/cgroup:/sys/fs/cgroup:rw
-          localhost/{{ image_name }}:latest /sbin/init
-      register: podman_run
-      changed_when: podman_run.rc == 0
+      block:
+        - name: Write registration credentials to credstore
+          when: registration_enabled
+          block:
+            - name: Ensure credstore directory exists
+              ansible.builtin.file:
+                path: "{{ credstore_dir }}"
+                state: directory
+                mode: "0700"
 
-    - name: Generate QEMU (qcow2) disk using bootc-image-builder
-      when: deployment_mode == 'kvm'
-      ansible.builtin.command:
-        cmd: >
-          podman run --rm -i --privileged --pull=newer
-          -v /var/lib/containers/storage:/var/lib/containers/storage
-          -v {{ build_dir }}/output:/output
-          registry.redhat.io/rhel10/bootc-image-builder:latest
-          --type qcow2 localhost/{{ image_name }}:latest
-      args:
-        creates: "{{ build_dir }}/output/qcow2/disk.qcow2"
+            - name: Write credentials
+              ansible.builtin.copy:
+                dest: "{{ credstore_dir }}/{{ item.name }}"
+                content: "{{ item.value }}"
+                mode: "0600"
+              loop:
+                - { name: goose.org_id, value: "{{ insights_org_id }}" }
+                - { name: goose.activation_key, value: "{{ insights_activation_key }}" }
+              loop_control:
+                label: "{{ item.name }}"
+              no_log: true
 
-    - name: Deploy to KVM via virt-install
+        - name: Install Quadlet unit
+          ansible.builtin.template:
+            src: templates/goose-node.container.j2
+            dest: "/etc/containers/systemd/{{ vm_name }}.container"
+            mode: "0644"
+          register: quadlet_unit
+
+        - name: Inspect running container
+          ansible.builtin.command: podman container inspect {{ vm_name }}
+          register: container_info
+          changed_when: false
+          failed_when: false
+
+        - name: Start (or restart onto the new image) the container service
+          ansible.builtin.systemd_service:
+            name: "{{ vm_name }}.service"
+            daemon_reload: true
+            state: >-
+              {{ 'restarted'
+                 if (quadlet_unit.changed
+                     or container_info.rc != 0
+                     or (container_info.stdout | from_json)[0].Image != image_id)
+                 else 'started' }}
+
+    # -------------------------------------------------------------------- kvm
+    - name: KVM deployment
       when: deployment_mode == 'kvm'
-      ansible.builtin.command:
-        cmd: >
-          virt-install --name {{ vm_name }}
-          --memory 4096 --vcpus 2
-          --os-variant rhel10.0
-          --import --disk {{ build_dir }}/output/qcow2/disk.qcow2,format=qcow2
-          --network default --noautoconsole
-      register: kvm_deploy
-      changed_when: kvm_deploy.rc == 0
+      block:
+        - name: Ensure output directory exists
+          ansible.builtin.file:
+            path: "{{ build_dir }}/output"
+            state: directory
+            mode: "0755"
+
+        - name: Render bootc-image-builder config
+          ansible.builtin.template:
+            src: templates/config.toml.j2
+            dest: "{{ build_dir }}/config.toml"
+            mode: "0600"
+          register: bib_config
+
+        - name: Read image ID the current disk was built from
+          ansible.builtin.command: cat {{ build_dir }}/output/.image-id
+          register: disk_image_id
+          changed_when: false
+          failed_when: false
+
+        - name: Determine whether the qcow2 disk is stale
+          ansible.builtin.set_fact:
+            disk_stale: "{{ bib_config.changed or disk_image_id.rc != 0 or disk_image_id.stdout != image_id }}"
+
+        - name: Regenerate qcow2 disk
+          when: disk_stale
+          block:
+            - name: Remove stale disk output
+              ansible.builtin.file:
+                path: "{{ build_dir }}/output/qcow2"
+                state: absent
+
+            - name: Generate qcow2 disk with bootc-image-builder
+              ansible.builtin.command:
+                argv:
+                  - podman
+                  - run
+                  - --rm
+                  - --privileged
+                  - --pull=newer
+                  - --security-opt
+                  - label=type:unconfined_t
+                  - -v
+                  - "{{ build_dir }}/config.toml:/config.toml:ro"
+                  - -v
+                  - "{{ build_dir }}/output:/output"
+                  - -v
+                  - /var/lib/containers/storage:/var/lib/containers/storage
+                  - "{{ builder_image }}"
+                  - --type
+                  - qcow2
+                  - "{{ image_ref }}"
+              changed_when: true
+
+            - name: Record image ID for the generated disk
+              ansible.builtin.copy:
+                dest: "{{ build_dir }}/output/.image-id"
+                content: "{{ image_id }}"
+                mode: "0644"
+
+        - name: Check whether the VM already exists
+          ansible.builtin.command: virsh dominfo {{ vm_name }}
+          register: vm_info
+          changed_when: false
+          failed_when: false
+
+        - name: Remove existing VM (vm_recreate=true)
+          when: vm_info.rc == 0 and vm_recreate
+          block:
+            - name: Stop VM
+              ansible.builtin.command: virsh destroy {{ vm_name }}
+              register: vm_destroy
+              changed_when: vm_destroy.rc == 0
+              failed_when: false
+
+            - name: Undefine VM and remove its storage
+              ansible.builtin.command: virsh undefine {{ vm_name }} --remove-all-storage
+              changed_when: true
+
+        - name: Install VM
+          when: vm_info.rc != 0 or vm_recreate
+          block:
+            - name: Copy disk into libvirt image directory
+              ansible.builtin.command:
+                argv: [cp, --sparse=always, "{{ build_dir }}/output/qcow2/disk.qcow2", "{{ vm_disk_path }}"]
+                creates: "{{ vm_disk_path }}"
+
+            - name: Create VM with virt-install
+              ansible.builtin.command:
+                argv: >-
+                  {{ ['virt-install', '--name', vm_name,
+                      '--memory', vm_memory | string, '--vcpus', vm_vcpus | string,
+                      '--os-variant', vm_os_variant,
+                      '--import', '--disk', vm_disk_path ~ ',format=qcow2,bus=virtio',
+                      '--network', 'network=' ~ vm_network ~ ',model=virtio',
+                      '--graphics', 'none', '--noautoconsole']
+                     + (['--sysinfo',
+                         'type=smbios'
+                         ~ ',oemStrings.entry0=io.systemd.credential:goose.org_id=' ~ insights_org_id
+                         ~ ',oemStrings.entry1=io.systemd.credential:goose.activation_key=' ~ insights_activation_key]
+                        if registration_enabled else []) }}
+              changed_when: true
+              no_log: "{{ registration_enabled }}"
+
+        - name: Warn that the running VM was not updated
+          when: vm_info.rc == 0 and not vm_recreate and disk_stale
+          ansible.builtin.debug:
+            msg: >-
+              {{ vm_name }} already exists and was left untouched. Update it in
+              place with `sudo bootc upgrade` inside the VM (requires
+              image_registry), or re-run with -e vm_recreate=true to rebuild it.
+
+        - name: Wait for the VM to get an IP address
+          ansible.builtin.command: virsh domifaddr {{ vm_name }}
+          register: vm_addr
+          until: vm_addr.stdout is search('ipv4')
+          retries: 24
+          delay: 5
+          changed_when: false
+          failed_when: false
+
+        - name: Show connection details
+          ansible.builtin.debug:
+            msg: >-
+              {{ ('ssh ' ~ admin_user ~ '@' ~ (vm_addr.stdout | regex_search('(\d+\.){3}\d+')))
+                 if vm_addr.stdout is search('ipv4')
+                 else 'No IP yet; try: sudo virsh domifaddr ' ~ vm_name ~ ' or sudo virsh console ' ~ vm_name }}

@@ -1,0 +1,64 @@
+---
+# Shared settings for deploy-goose-server.yml and teardown-goose-server.yml.
+# Override any of these with -e on the command line.
+
+# --- Deployment ---------------------------------------------------------
+# 'kvm' provisions a libvirt VM; 'podman' runs a systemd container via Quadlet
+deployment_mode: "podman"
+vm_name: "goose-admin-node"
+
+# --- Image ----------------------------------------------------------------
+image_name: "goose-rhel10-troubleshooter"
+image_tag: "latest"
+# Optional registry repo (e.g. quay.io/myorg/goose-rhel10). When set, the
+# image is pushed there and deployed systems track it, so `bootc upgrade`
+# works. Run `podman login <registry>` first.
+image_registry: ""
+base_image: "registry.redhat.io/rhel10/rhel-bootc:latest"
+builder_image: "registry.redhat.io/rhel10/bootc-image-builder:latest"
+extra_packages: []          # e.g. [tcpdump, sysstat]
+build_no_cache: false       # true = re-run dnf to pick up newer packages
+build_dir: "/opt/goose-image-build"
+# Registry credentials. Empty = auto-detect: root's own login first, then
+# the invoking user's podman/docker auth files (so a rootless
+# `podman login` is enough).
+registry_authfile: ""
+
+# --- RHEL entitlement for the image build --------------------------------
+# Not needed on a registered RHEL host. On any other host (e.g. Fedora),
+# point this at a directory laid out like RHEL's /usr/share/rhel/secrets:
+#   etc-pki-entitlement/  (contents of /etc/pki/entitlement)
+#   rhsm/                 (contents of /etc/rhsm, incl. ca/)
+#   redhat.repo           (/etc/yum.repos.d/redhat.repo)
+rhsm_secrets_dir: ""
+
+# --- KVM settings ---------------------------------------------------------
+vm_memory: 4096
+vm_vcpus: 2
+vm_os_variant: "rhel10.0"
+vm_network: "default"
+vm_disk_size: "20 GiB"
+vm_recreate: false          # true = destroy and rebuild an existing VM
+libvirt_image_dir: "/var/lib/libvirt/images"
+admin_user: "goose"
+admin_ssh_pubkey_file: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/id_ed25519.pub"
+admin_ssh_pubkey: "{{ lookup('ansible.builtin.file', admin_ssh_pubkey_file, errors='ignore') | default('', true) }}"
+admin_sudo_nopasswd: true
+
+# --- Podman settings ------------------------------------------------------
+podman_privileged: false
+
+# --- Optional first-boot RHSM + Insights registration --------------------
+# Supply both via secrets.yml (-e @secrets.yml) to auto-register. Never commit them.
+insights_org_id: ""
+insights_activation_key: ""
+
+# --- Derived (don't edit) -------------------------------------------------
+image_ref: "{{ (image_registry ~ ':' ~ image_tag) if image_registry else ('localhost/' ~ image_name ~ ':' ~ image_tag) }}"
+registration_enabled: "{{ (insights_org_id | length > 0) and (insights_activation_key | length > 0) }}"
+credstore_dir: "{{ build_dir }}/credstore"
+vm_disk_path: "{{ libvirt_image_dir }}/{{ vm_name }}.qcow2"
+kvm_packages:
+  - libvirt
+  - virt-install
+  - qemu-kvm
