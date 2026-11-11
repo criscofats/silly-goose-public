@@ -1,0 +1,16 @@
+[Unit]
+Description=Register with Red Hat Subscription Management and Insights (first boot)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=!/var/lib/goose-register/done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Picks up goose.org_id / goose.activation_key from SMBIOS (KVM) or
+# /run/credstore (Podman).
+ImportCredential=goose.*
+ExecStart=/usr/libexec/goose-register
+
+[Install]
+WantedBy=multi-user.target

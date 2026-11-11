@@ -1,0 +1,211 @@
+---
+# Removes everything deploy-goose-server.yml creates, in BOTH modes, so the
+# deploy can be repeated from a clean slate. Safe to run when nothing (or only
+# part of it) is deployed.
+#
+# Left in place on purpose: installed packages, libvirt daemons/network,
+# registry logins, rhsm_secrets_dir, and any image pushed to image_registry.
+- name: Tear down RHEL 10 Image Mode Server with Goose-RedHat
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+
+  vars_files:
+    - vars/goose.yml
+
+  vars:
+    # Unregister from RHSM/Insights before destroying, so repeated runs don't
+    # leave stale systems in console.redhat.com.
+    teardown_unregister: true
+    # Also delete the base and builder images pulled from registry.redhat.io
+    # (forces a full re-pull on the next deploy).
+    teardown_remove_base_images: false
+    quadlet_path: "/etc/containers/systemd/{{ vm_name }}.container"
+
+  vars_prompt:
+    - name: teardown_confirm
+      prompt: "Destroy {{ vm_name }} (container and VM), its data, images and {{ build_dir }}? Type 'yes'"
+      private: false
+      default: "no"
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+  pre_tasks:
+    - name: Require confirmation
+      ansible.builtin.assert:
+        that: teardown_confirm == 'yes'
+        fail_msg: "Aborted. Pass -e teardown_confirm=yes to skip the prompt."
+
+    - name: Refuse to delete a dangerous build_dir
+      ansible.builtin.assert:
+        that:
+          - build_dir is match('^/.+/.+')
+          - build_dir | regex_replace('/+$', '') not in ['/opt', '/var', '/etc', '/usr', '/home', '/root', '/srv', '/tmp']
+        fail_msg: "Refusing to remove build_dir={{ build_dir }}"
+
+  tasks:
+    # --------------------------------------------------------------- podman
+    - name: Check for the Podman container
+      ansible.builtin.command: podman container inspect --format '{{ "{{" }}.State.Running{{ "}}" }}' {{ vm_name }}
+      register: container_state
+      changed_when: false
+      failed_when: false
+
+    - name: Unregister the container from Insights and RHSM
+      when:
+        - teardown_unregister
+        - container_state.rc == 0
+        - container_state.stdout == 'true'
+      ansible.builtin.command:
+        argv:
+          - podman
+          - exec
+          - "{{ vm_name }}"
+          - sh
+          - -c
+          - >-
+            if subscription-manager identity >/dev/null 2>&1; then
+            insights-client --unregister || true;
+            subscription-manager unregister && echo UNREGISTERED;
+            fi
+      register: container_unregister
+      changed_when: "'UNREGISTERED' in container_unregister.stdout"
+      failed_when: false
+
+    - name: Check for the Quadlet unit
+      ansible.builtin.stat:
+        path: "{{ quadlet_path }}"
+      register: quadlet_file
+
+    - name: Stop the container service
+      when: quadlet_file.stat.exists
+      ansible.builtin.systemd_service:
+        name: "{{ vm_name }}.service"
+        state: stopped
+      failed_when: false
+
+    - name: Remove the Quadlet unit
+      ansible.builtin.file:
+        path: "{{ quadlet_path }}"
+        state: absent
+      notify: Reload systemd
+
+    - name: Apply the systemd reload now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Remove the container (if still present)
+      when: container_state.rc == 0
+      ansible.builtin.command: podman rm --force --ignore {{ vm_name }}
+      changed_when: true
+
+    - name: Check for the persistent /var volume
+      ansible.builtin.command: podman volume exists {{ vm_name }}-var
+      register: var_volume
+      changed_when: false
+      failed_when: var_volume.rc not in [0, 1]
+
+    - name: Remove the persistent /var volume
+      when: var_volume.rc == 0
+      ansible.builtin.command: podman volume rm --force {{ vm_name }}-var
+      changed_when: true
+
+    # ------------------------------------------------------------------ kvm
+    - name: Check whether virsh is available
+      ansible.builtin.command: which virsh
+      register: virsh_bin
+      changed_when: false
+      failed_when: false
+
+    - name: KVM teardown
+      when: virsh_bin.rc == 0
+      block:
+        - name: Check for the VM
+          ansible.builtin.command: virsh domstate {{ vm_name }}
+          register: vm_state
+          changed_when: false
+          failed_when: false
+
+        - name: Unregister the VM from Insights and RHSM over SSH
+          when:
+            - teardown_unregister
+            - vm_state.rc == 0
+            - vm_state.stdout is search('running')
+          block:
+            - name: Find the VM's IP address
+              ansible.builtin.command: virsh domifaddr {{ vm_name }}
+              register: vm_addr
+              changed_when: false
+              failed_when: false
+
+            - name: Unregister via SSH as {{ admin_user }}
+              when: vm_addr.stdout is search('ipv4')
+              become: false   # use the invoking user's SSH key
+              ansible.builtin.command:
+                argv:
+                  - ssh
+                  - -o
+                  - BatchMode=yes
+                  - -o
+                  - ConnectTimeout=10
+                  - -o
+                  - StrictHostKeyChecking=no
+                  - -o
+                  - UserKnownHostsFile=/dev/null
+                  - "{{ admin_user }}@{{ vm_addr.stdout | regex_search('(\\d+\\.){3}\\d+') }}"
+                  - >-
+                    if sudo subscription-manager identity >/dev/null 2>&1; then
+                    sudo insights-client --unregister || true;
+                    sudo subscription-manager unregister && echo UNREGISTERED;
+                    fi
+              register: vm_unregister
+              changed_when: "'UNREGISTERED' in vm_unregister.stdout"
+              failed_when: false
+
+            - name: Warn if the VM could not be unregistered
+              when: vm_addr.stdout is not search('ipv4') or (vm_unregister.rc | default(1)) != 0
+              ansible.builtin.debug:
+                msg: >-
+                  Could not reach {{ vm_name }} to unregister it. If it was
+                  registered, remove it manually at
+                  https://console.redhat.com/insights/inventory
+
+        - name: Stop the VM
+          when: vm_state.rc == 0 and vm_state.stdout is not search('shut off')
+          ansible.builtin.command: virsh destroy {{ vm_name }}
+          changed_when: true
+
+        - name: Undefine the VM and remove its storage
+          when: vm_state.rc == 0
+          ansible.builtin.command: virsh undefine {{ vm_name }} --remove-all-storage
+          changed_when: true
+
+    - name: Remove the VM disk (if left behind)
+      ansible.builtin.file:
+        path: "{{ vm_disk_path }}"
+        state: absent
+
+    # --------------------------------------------------------------- images
+    - name: Remove locally built image tags
+      ansible.builtin.command: podman rmi --ignore {{ item }}
+      loop: "{{ [image_ref, 'localhost/' ~ image_name ~ ':' ~ image_tag] | unique }}"
+      register: image_rm
+      changed_when: image_rm.stdout | length > 0
+
+    - name: Remove base and builder images
+      when: teardown_remove_base_images
+      ansible.builtin.command: podman rmi --ignore {{ item }}
+      loop:
+        - "{{ base_image }}"
+        - "{{ builder_image }}"
+      register: base_rm
+      changed_when: base_rm.stdout | length > 0
+
+    # ------------------------------------------------------------ build dir
+    - name: Remove the build directory (Containerfile, credstore, qcow2 output)
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: absent

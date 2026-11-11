@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+# bootc-image-builder customizations for the KVM disk image.
+
+[[customizations.user]]
+name = "{{ admin_user }}"
+key = "{{ admin_ssh_pubkey | trim }}"
+groups = ["wheel"]
+
+[[customizations.filesystem]]
+mountpoint = "/"
+minsize = "{{ vm_disk_size }}"

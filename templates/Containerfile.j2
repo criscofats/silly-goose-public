@@ -1,0 +1,29 @@
+# {{ ansible_managed }}
+FROM {{ base_image }}
+
+# RHEL content comes from the *build host's* entitlement:
+#   - registered RHEL host: podman passes /run/secrets through automatically
+#   - any other host (e.g. Fedora): the playbook mounts rhsm_secrets_dir at /run/secrets
+# subscription-manager is not usable inside a container build, so enable the
+# extensions repo per-transaction instead.
+RUN dnf install -y --enablerepo="rhel-10-for-$(arch)-extensions-rpms" \
+        goose-redhat \
+        insights-client{% for pkg in extra_packages %} \
+        {{ pkg }}{% endfor %} && \
+    dnf clean all
+
+# First-boot Red Hat / Insights registration. No-op unless credentials are
+# supplied at runtime (SMBIOS for KVM, /run/credstore for Podman) - nothing
+# secret is baked into the image.
+COPY goose-register.sh /usr/libexec/goose-register
+COPY goose-register.service /usr/lib/systemd/system/goose-register.service
+RUN chmod 0755 /usr/libexec/goose-register && \
+    systemctl enable goose-register.service
+{% if admin_sudo_nopasswd %}
+
+# Admin user is key-only (no password), so allow wheel to sudo without one.
+RUN echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/90-wheel-nopasswd && \
+    chmod 0440 /etc/sudoers.d/90-wheel-nopasswd
+{% endif %}
+
+RUN bootc container lint
