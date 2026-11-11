@@ -15,6 +15,7 @@ This project contains an Ansible playbook that builds and deploys a Red Hat Ente
 ## Repository Layout
 
 ```
+bootstrap.sh                    # prepare a fresh host, write secrets.yml
 deploy-goose-server.yml         # build and deploy
 teardown-goose-server.yml       # remove everything deploy created
 vars/goose.yml                  # shared settings for both playbooks
@@ -24,6 +25,31 @@ templates/config.toml.j2        # bootc-image-builder config (KVM admin user, di
 templates/goose-node.container.j2  # Quadlet unit (Podman mode)
 files/goose-register.{sh,service}  # first-boot RHSM + Insights registration
 ```
+
+## Quick start on a fresh host
+
+`bootstrap.sh` prepares a fresh Fedora or RHEL-family install so you can deploy straight away:
+
+```bash
+git clone git@github.com:criscofats/silly-goose.git && cd silly-goose
+./bootstrap.sh
+```
+
+Run it as your normal user, not root. It uses `sudo` only to install packages. It:
+
+1. **Checks dependencies:** `ansible-core` (at least 2.14), `podman`, `openssh-clients` and `python3`. It lists anything missing and offers to install it with `dnf`. It also warns if `/dev/kvm` is absent, since KVM mode needs it. The playbook installs the KVM packages itself.
+2. **Checks the `registry.redhat.io` login,** and offers to run `podman login` if you aren't logged in.
+3. **Asks for your settings and writes `secrets.yml`:**
+   - deployment mode;
+   - Red Hat org ID and activation key, for the node's automatic registration;
+   - how the image build gets RHEL content: your Red Hat account, a copied entitlement folder, or a registered RHEL host;
+   - your Red Hat login, if you choose the account option without an activation key;
+   - for KVM, it offers to create `~/.ssh/id_ed25519`.
+
+   Secrets are typed hidden, values are quoted safely for YAML, and the file is written with mode 0600. An existing `secrets.yml` is kept unless you choose to replace it, in which case it's backed up as `secrets.yml.bak-<timestamp>`, also git-ignored. Finally it offers to encrypt the file with `ansible-vault`.
+4. **Prints the deploy and teardown commands** (adding `--ask-vault-pass` if the file is encrypted) and offers to run the deploy.
+
+Options: `-y` installs missing packages without asking; `--no-secrets` and `--no-login` skip those steps; `--allow-root` allows running as root. Everything below describes what the script sets up, if you'd rather do it by hand.
 
 ## Prerequisites
 
