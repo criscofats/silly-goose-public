@@ -31,7 +31,7 @@ files/goose-register.{sh,service}  # first-boot RHSM + Insights registration
 `bootstrap.sh` prepares a fresh Fedora or RHEL-family install so you can deploy straight away:
 
 ```bash
-git clone git@github.com:criscofats/silly-goose.git && cd silly-goose
+git clone https://github.com/criscofats/silly-goose-public.git && cd silly-goose-public
 ./bootstrap.sh
 ```
 
