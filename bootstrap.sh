@@ -89,6 +89,32 @@ ask_secret() {
     printf '%s' "$ans"
 }
 
+# ask_masked "prompt" -> prints answer, echoing '*' for each character typed.
+# Backspace deletes, Ctrl-U clears, arrow/escape keys are ignored. When stdin
+# is not a terminal (piped or scripted input) it falls back to hidden input.
+ask_masked() {
+    local q="$1" ans="" ch
+    if [[ ! -t 0 ]]; then
+        read -r -s ans || ans=""
+        printf '%s' "$ans"
+        return
+    fi
+    printf '  %s: ' "$q" >&2
+    while IFS= read -r -s -n1 ch; do
+        case "$ch" in
+            "") break ;;                                   # Enter
+            $'\x7f'|$'\b')                                 # Backspace / Ctrl-H
+                if [[ -n "$ans" ]]; then ans="${ans%?}"; printf '\b \b' >&2; fi ;;
+            $'\x15')                                       # Ctrl-U: clear the line
+                while [[ -n "$ans" ]]; do ans="${ans%?}"; printf '\b \b' >&2; done ;;
+            $'\e') read -r -s -n2 -t 0.1 _ || true ;;       # swallow arrow-key sequences
+            *) ans+="$ch"; printf '*' >&2 ;;
+        esac
+    done
+    printf '\n' >&2
+    printf '%s' "$ans"
+}
+
 # YAML single-quoted scalar ('' escapes a quote). Inputs are single-line.
 yq() { local s="${1//\'/\'\'}"; printf "'%s'" "$s"; }
 
@@ -232,7 +258,7 @@ if [[ $SKIP_SECRETS -eq 0 ]]; then
         echo "  Create an activation key at https://console.redhat.com/insights/connector/activation-keys"
         ORG_ID=""; ACT_KEY=""
         while :; do
-            ORG_ID="$(ask "Organization ID (blank to skip automatic registration)" "")"
+            ORG_ID="$(ask_masked "Organization ID (blank to skip automatic registration)")"
             [[ -z "$ORG_ID" || "$ORG_ID" =~ ^[0-9]+$ ]] && break
             warn "The organization ID is numeric."
         done
@@ -271,7 +297,7 @@ if [[ $SKIP_SECRETS -eq 0 ]]; then
                         warn "Passwords were empty or didn't match."
                     done
                     unset p2
-                    BUILDER_ORG="$(ask "Organization ID for the builder (only if your login belongs to several orgs)" "")"
+                    BUILDER_ORG="$(ask_masked "Organization ID for the builder (only if your login belongs to several orgs)")"
                 fi
                 ;;
             2)
