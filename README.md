@@ -19,6 +19,8 @@ bootstrap.sh                    # prepare a fresh host, write settings.yml + sec
 deploy-goose-server.yml         # build and deploy
 teardown-goose-server.yml       # remove everything deploy created
 vars/goose.yml                  # shared settings for both playbooks
+vars/host/<platform>.yml        # host-specific settings (packages, services) per platform
+tasks/host-platform.yml         # detects the host platform and loads vars/host/<platform>.yml
 settings.example.yml            # template for local settings.yml (plain, git-ignored)
 secrets.example.yml             # template for local secrets.yml (credentials only, git-ignored)
 templates/Containerfile.j2      # bootc image definition
@@ -54,6 +56,20 @@ Run it as your normal user, not root. It uses `sudo` only to install packages. I
 4. **Prints the deploy and teardown commands** (adding `--ask-vault-pass` if `secrets.yml` is encrypted) and offers to run the deploy.
 
 Options: `-y` installs missing packages without asking; `--no-secrets` and `--no-login` skip those steps; `--allow-root` allows running as root. Everything below describes what the script sets up, if you'd rather do it by hand.
+
+## Supported host platforms
+
+| Platform | Status | Notes |
+|---|---|---|
+| Fedora, RHEL, CentOS Stream and other RHEL-family Linux | Supported | `dnf`, systemd, SELinux, modular libvirt daemons |
+| Other Linux distributions, Windows (WSL2), macOS | Planned | Work in progress on feature branches |
+
+The playbooks and `bootstrap.sh` detect the host and stop with a clear message on anything else. Everything host-specific sits in one place, so adding a platform is mostly additive:
+
+1. **Playbooks:** map the host's Ansible `os_family` to a platform name in `tasks/host-platform.yml`, then create `vars/host/<platform>.yml` with the `host_*` variables (copy `vars/host/fedora_rhel.yml`). `host_is_wsl` is already detected for platforms that need to tell WSL apart.
+2. **`bootstrap.sh`:** add a `case` entry in the host platform section that sets `PLATFORM`, `PKG_MGR` and the `PKG_FOR` map from command to package.
+
+The image build, registration and goose verification are shared by every platform.
 
 ## Prerequisites
 

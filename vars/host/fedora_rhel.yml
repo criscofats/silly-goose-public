@@ -1,0 +1,19 @@
+---
+# Host settings for Fedora and RHEL-family hosts: dnf, systemd, SELinux and the
+# modular libvirt daemons. Loaded by tasks/host-platform.yml.
+
+# Installed on every deploy.
+host_container_packages:
+  - podman
+
+# Installed for deployment_mode=kvm (vars/goose.yml exposes these as kvm_packages).
+host_kvm_packages:
+  - libvirt
+  - virt-install
+  - qemu-kvm
+
+# libvirt daemons/sockets to enable for deployment_mode=kvm.
+host_libvirt_services:
+  - virtqemud.socket
+  - virtnetworkd.socket
+  - virtstoraged.socket
