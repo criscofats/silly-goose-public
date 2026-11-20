@@ -46,8 +46,8 @@ Run it as your normal user, not root. It uses `sudo` only to install packages. I
    - your Red Hat login, if you choose the account option without an activation key;
    - for KVM, it offers to create `~/.ssh/id_ed25519`.
 
-   Secrets are typed hidden, values are quoted safely for YAML, and the file is written with mode 0600. An existing `secrets.yml` is kept unless you choose to replace it, in which case it's backed up as `secrets.yml.bak-<timestamp>`, also git-ignored. Finally it offers to encrypt the file with `ansible-vault`.
-4. **Prints the deploy and teardown commands** (adding `--ask-vault-pass` if the file is encrypted) and offers to run the deploy.
+   Secrets are typed hidden, values are quoted safely for YAML, and the file is written with mode 0600. An existing `secrets.yml` is kept unless you choose to replace it, in which case it's backed up as `secrets.yml.bak-<timestamp>`, also git-ignored. Finally it offers to vault-encrypt the credential values. It encrypts each credential individually (inline `!vault` values) and leaves plain settings such as `deployment_mode` readable; see [Local settings and credentials](#local-settings-and-credentials-secretsyml) for why.
+4. **Prints the deploy and teardown commands** (adding `--ask-vault-pass` if the file contains vault-encrypted values) and offers to run the deploy.
 
 Options: `-y` installs missing packages without asking; `--no-secrets` and `--no-login` skip those steps; `--allow-root` allows running as root. Everything below describes what the script sets up, if you'd rather do it by hand.
 
@@ -183,7 +183,15 @@ insights_org_id: "1234567"
 insights_activation_key: "goose-node-key"
 ```
 
-To keep the file encrypted at rest, run `ansible-vault encrypt secrets.yml`, then add `--ask-vault-pass` to each run.
+To keep the credentials encrypted at rest, **encrypt the values, not the whole file**, then add `--ask-vault-pass` to each run. `bootstrap.sh` does this for you. To do it by hand:
+
+```bash
+printf %s 'my-activation-key' | ansible-vault encrypt_string --stdin-name insights_activation_key
+```
+
+Paste the output into `secrets.yml` in place of the plain line, using the same vault password for every value.
+
+Don't run `ansible-vault encrypt secrets.yml` on the whole file. Since ansible-core 2.22, Ansible registers *every* string in a vault-encrypted vars file as a secret and redacts it wherever it appears in output, so `deployment_mode: podman` turns every `podman` in the playbook output, including the connection instructions, into `$REDACTED$`. Values encrypted inline are redacted the same way, which is exactly what you want for credentials.
 
 `-K` prompts for your sudo password. The play escalates to root to build images, write to `/etc` and manage libvirt.
 
@@ -302,6 +310,8 @@ ansible-playbook deploy-goose-server.yml   -K -e @secrets.yml
 ```
 
 ## Troubleshooting
+
+* **Output shows `$REDACTED$` instead of `podman` (or a path, or `kvm`):** your `secrets.yml` is vault-encrypted as a whole file, so ansible-core 2.22+ treats every value in it as a secret. Re-run `./bootstrap.sh` and choose to replace `secrets.yml`; the old file is kept as a backup. It writes the credentials as individual `!vault` values and leaves the settings in plain text. See [Local settings and credentials](#local-settings-and-credentials-secretsyml).
 
 * **`No working registry.redhat.io login found`:** run `podman login registry.redhat.io`. The error includes Podman's own message. Logins stored under `/run/...` are cleared on reboot, so log in again after restarting.
 * **`No match for argument: goose-redhat` / repo errors during the build:** the build can't see RHEL repositories. On RHEL, check `sudo subscription-manager repos --list-enabled`. On other hosts, check the `rhsm_secrets_dir` contents and how old the certificates are.

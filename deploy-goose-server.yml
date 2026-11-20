@@ -504,7 +504,9 @@
 
 
     - name: Check how secrets.yml should be passed (for the printed commands)
-      ansible.builtin.command: head -c 14 {{ playbook_dir }}/secrets.yml
+      # rc 0 = secrets.yml contains vault data (whole file or inline !vault values),
+      # rc 1 = plain secrets.yml, rc 2 = no secrets.yml
+      ansible.builtin.command: grep -c -F ANSIBLE_VAULT {{ playbook_dir }}/secrets.yml
       register: secrets_head
       changed_when: false
       failed_when: false
@@ -514,8 +516,8 @@
         msg: "{{ (podman_lines if deployment_mode == 'podman' else kvm_lines) + cli_lines }}"
       vars:
         secrets_args: >-
-          {{ (' -e @secrets.yml' if secrets_head.rc == 0 else '')
-             ~ (' --ask-vault-pass' if secrets_head.stdout is search('ANSIBLE_VAULT') else '') }}
+          {{ (' -e @secrets.yml' if secrets_head.rc in [0, 1] else '')
+             ~ (' --ask-vault-pass' if secrets_head.rc == 0 else '') }}
         deploy_cmd: "cd {{ playbook_dir }} && ansible-playbook deploy-goose-server.yml -K{{ secrets_args }}"
         teardown_cmd: "cd {{ playbook_dir }} && ansible-playbook teardown-goose-server.yml -K{{ secrets_args }}"
         vm_ip: "{{ ((vm_addr | default({})).stdout | default('')) | regex_search('(\\d+\\.){3}\\d+') | default('', true) }}"
