@@ -1,7 +1,10 @@
 # Local credentials / machine-specific settings
 secrets.yml
+settings.yml
 *.secrets.yml
 ansible-navigator.log
-# bootstrap.sh backups and in-progress writes of secrets.yml
+# bootstrap.sh backups and in-progress writes of secrets.yml / settings.yml
 secrets.yml.bak-*
 .secrets.yml.*
+settings.yml.bak-*
+.settings.yml.*
