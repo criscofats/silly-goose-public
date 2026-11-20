@@ -4,8 +4,10 @@
 #   1. Checks for (and offers to install) everything needed before Ansible can
 #      take over: ansible-core, podman, openssh-clients, python3.
 #   2. Checks the registry.redhat.io login and offers to log in.
-#   3. Prompts for the local settings / credentials and writes secrets.yml
-#      (mode 0600, git-ignored), optionally vault-encrypting the credential values.
+#   3. Prompts for the local settings and credentials and writes two
+#      git-ignored files: settings.yml (plain; loaded automatically by the
+#      playbooks) and secrets.yml (credentials only, mode 0600, optionally
+#      ansible-vault encrypted as a whole).
 #   4. Prints (and optionally runs) the deploy command.
 #
 # The playbook itself installs the KVM packages (libvirt, virt-install,
@@ -14,6 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS_FILE="${SCRIPT_DIR}/secrets.yml"
+SETTINGS_FILE="${SCRIPT_DIR}/settings.yml"
 MIN_ANSIBLE_CORE="2.14"
 REGISTRY="registry.redhat.io"
 
@@ -30,7 +33,7 @@ Prepare this host to run deploy-goose-server.yml.
 
 Options:
   -y, --yes          Install missing packages without asking
-      --no-secrets   Skip the secrets.yml questions
+      --no-secrets   Skip the settings.yml / secrets.yml questions
       --no-login     Skip the registry.redhat.io login check
       --allow-root   Allow running as root (not recommended; see README)
   -h, --help         Show this help
@@ -215,33 +218,45 @@ if [[ $SKIP_LOGIN -eq 0 ]]; then
     fi
 fi
 
-# ------------------------------------------------------------ secrets.yml
+# ------------------------------------------------- settings.yml + secrets.yml
+# settings.yml holds plain settings; secrets.yml holds ONLY credentials. Keep
+# them apart: ansible-core 2.22+ registers every value of a vault-encrypted
+# vars file as a secret and redacts that text everywhere in output, so a
+# setting like deployment_mode: podman in an encrypted file shows as $REDACTED$.
 ENCRYPTED=0
 DEPLOY_MODE="podman"
+is_vault() { grep -q 'ANSIBLE_VAULT' "$1" 2>/dev/null; }
 
 if [[ $SKIP_SECRETS -eq 0 ]]; then
-    step "Local settings and credentials (secrets.yml)"
+    step "Local settings (settings.yml) and credentials (secrets.yml)"
     write_it=1
-    if [[ -e "$SECRETS_FILE" ]]; then
-        if head -c 14 "$SECRETS_FILE" | grep -q '^\$ANSIBLE_VAULT'; then
-            warn "secrets.yml already exists and is encrypted as a WHOLE file."
-            warn "ansible-core 2.22+ then redacts every value in it from playbook output - e.g. 'podman'"
-            warn "shows as \$REDACTED\$. Replace it to switch to per-value encryption."
-            ENCRYPTED=1
-        elif grep -q 'ANSIBLE_VAULT' "$SECRETS_FILE"; then
-            warn "secrets.yml already exists (credential values ansible-vault encrypted)."
-            ENCRYPTED=1
-        else
-            warn "secrets.yml already exists."
+    if [[ -e "$SETTINGS_FILE" || -e "$SECRETS_FILE" ]]; then
+        [[ -e "$SETTINGS_FILE" ]] && warn "settings.yml already exists."
+        if [[ -e "$SECRETS_FILE" ]]; then
+            if is_vault "$SECRETS_FILE"; then
+                warn "secrets.yml already exists (ansible-vault encrypted)."
+                ENCRYPTED=1
+            else
+                warn "secrets.yml already exists."
+            fi
+            if [[ ! -e "$SETTINGS_FILE" ]]; then
+                warn "No settings.yml: secrets.yml is probably the older combined format (settings and"
+                warn "credentials in one file). If it is encrypted, Ansible redacts every value in it from"
+                warn "output - e.g. 'podman' shows as \$REDACTED\$. Replace it to split it into two files."
+            fi
         fi
-        if ask_yn "Replace it? (the current file is kept as a timestamped backup)" n; then
-            backup="${SECRETS_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
-            cp -p "$SECRETS_FILE" "$backup"
-            ok "Backed up to $(basename "$backup")"
+        if ask_yn "Replace them? (existing files are kept as timestamped backups)" n; then
+            stamp="$(date +%Y%m%d-%H%M%S)"
+            for f in "$SETTINGS_FILE" "$SECRETS_FILE"; do
+                if [[ -e "$f" ]]; then
+                    cp -p "$f" "${f}.bak-${stamp}"
+                    ok "Backed up $(basename "$f") to $(basename "$f").bak-${stamp}"
+                fi
+            done
             ENCRYPTED=0
         else
             write_it=0
-            ok "Keeping the existing secrets.yml"
+            ok "Keeping the existing files"
         fi
     fi
 
@@ -273,6 +288,24 @@ if [[ $SKIP_SECRETS -eq 0 ]]; then
                 [[ "$ACT_KEY" =~ ^[A-Za-z0-9._-]+$ ]] && break
                 warn "Activation key names use letters, digits, '.', '_' and '-' only."
             done
+            # Ansible redacts a vault-encrypted value wherever its full text appears
+            # in output. A short key, or one contained in text this project prints,
+            # would garble unrelated output (e.g. key 'goose' -> '$REDACTED$-proxy').
+            clash=""
+            for term in goose-admin-node goose-proxy goose-image-builder goose-rhel10-troubleshooter \
+                        goose-verify goose-register podman kvm rhel redhat registry.redhat.io insights \
+                        localhost admin root latest deploy teardown systemd quadlet bootc; do
+                [[ "$term" == *"$ACT_KEY"* ]] && { clash="$term"; break; }
+            done
+            if [[ -n "$clash" || ${#ACT_KEY} -lt 8 ]]; then
+                if [[ -n "$clash" ]]; then
+                    warn "This activation key name is part of '$clash', which appears in normal output."
+                else
+                    warn "This activation key name is short (under 8 characters)."
+                fi
+                warn "If secrets.yml is encrypted, Ansible will show every occurrence of it as \$REDACTED\$."
+                warn "A longer, specific key name (e.g. goose-demo-node-2026) avoids that. Continuing anyway."
+            fi
         fi
 
         # build entitlement
@@ -333,76 +366,57 @@ if [[ $SKIP_SECRETS -eq 0 ]]; then
             fi
         fi
 
-        # Encrypt the credential VALUES only. Encrypting the whole file makes
-        # ansible-core 2.22+ register every value in it as a secret and redact
-        # it everywhere in playbook output (e.g. 'podman' -> $REDACTED$).
-        echo
-        VAULT_PW_FILE=""
-        if ask_yn "Encrypt the credentials with ansible-vault? (recommended; you'll choose a vault password)" y; then
-            while :; do
-                vp1="$(ask_secret "New vault password (hidden)")"
-                vp2="$(ask_secret "Repeat vault password")"
-                [[ -n "$vp1" && "$vp1" == "$vp2" ]] && break
-                warn "Passwords were empty or didn't match."
-            done
-            VAULT_PW_FILE="$(mktemp)"
-            trap 'rm -f "$VAULT_PW_FILE"' EXIT
-            chmod 600 "$VAULT_PW_FILE"
-            printf '%s\n' "$vp1" > "$VAULT_PW_FILE"
-            unset vp1 vp2
-        fi
-
-        # secret_entry <key> <value>: vault-encrypted when chosen (value passed on
-        # stdin, never on a command line); empty values stay as ''.
-        secret_entry() {
-            local key="$1" val="$2" enc
-            if [[ -n "$VAULT_PW_FILE" && -n "$val" ]]; then
-                enc="$(printf '%s' "$val" | ansible-vault encrypt_string \
-                        --vault-password-file "$VAULT_PW_FILE" --stdin-name "$key" 2>/dev/null)" \
-                    || die "ansible-vault could not encrypt $key"
-                printf '%s\n' "$enc"
-            else
-                printf '%s: %s\n' "$key" "$(yq "$val")"
-            fi
-        }
-
-        # write the file
-        tmp="$(mktemp "${SCRIPT_DIR}/.secrets.yml.XXXXXX")"
-        chmod 600 "$tmp"
+        # settings.yml: plain settings, loaded automatically by the playbooks
+        tmp="$(mktemp "${SCRIPT_DIR}/.settings.yml.XXXXXX")"
+        chmod 644 "$tmp"
         {
             echo "---"
-            echo "# Local, machine-specific settings and credentials. Ignored by git - never commit."
-            echo "# Generated by bootstrap.sh on $(date -Iseconds)."
-            echo "# Use with:  ansible-playbook deploy-goose-server.yml -K -e @secrets.yml"
-            echo "# Credential values may be inline !vault values; settings stay plain text so"
-            echo "# Ansible does not redact them from output. Re-run ./bootstrap.sh to change values."
+            echo "# Local, machine-specific settings (no credentials). Ignored by git."
+            echo "# Generated by bootstrap.sh on $(date -Iseconds). The playbooks load this file"
+            echo "# automatically; -e on the command line overrides it."
             echo "deployment_mode: $(yq "$DEPLOY_MODE")"
-            secret_entry insights_org_id "$ORG_ID"
-            secret_entry insights_activation_key "$ACT_KEY"
             case "$ENT" in
-                1)
-                    echo "rhsm_builder_register: true"
-                    if [[ -n "$BUILDER_USER" ]]; then
-                        secret_entry rhsm_builder_username "$BUILDER_USER"
-                        secret_entry rhsm_builder_password "$BUILDER_PASS"
-                        secret_entry rhsm_builder_org_id "$BUILDER_ORG"
-                    fi
-                    ;;
+                1) echo "rhsm_builder_register: true" ;;
                 2) echo "rhsm_secrets_dir: $(yq "$SECRETS_DIR")" ;;
             esac
         } > "$tmp"
-        unset BUILDER_PASS ACT_KEY
-        if [[ -n "$VAULT_PW_FILE" ]]; then
-            rm -f "$VAULT_PW_FILE"
-            trap - EXIT
-        fi
-        mv -f "$tmp" "$SECRETS_FILE"
-        if grep -q 'ANSIBLE_VAULT' "$SECRETS_FILE"; then
-            ENCRYPTED=1
-            ok "Wrote secrets.yml (mode 0600, ignored by git); credential values are vault-encrypted"
-        else
+        mv -f "$tmp" "$SETTINGS_FILE"
+        ok "Wrote settings.yml (plain text, ignored by git)"
+
+        # secrets.yml: credentials only (if any were entered)
+        if [[ -n "$ORG_ID$ACT_KEY$BUILDER_USER$BUILDER_PASS$BUILDER_ORG" ]]; then
+            tmp="$(mktemp "${SCRIPT_DIR}/.secrets.yml.XXXXXX")"
+            chmod 600 "$tmp"
+            {
+                echo "---"
+                echo "# Credentials only. Ignored by git - never commit. Generated by bootstrap.sh"
+                echo "# on $(date -Iseconds). Use with: -e @secrets.yml (add --ask-vault-pass if encrypted)."
+                echo "# Keep non-secret settings in settings.yml: Ansible redacts every value of an"
+                echo "# encrypted vars file wherever that text appears in output."
+                echo "insights_org_id: $(yq "$ORG_ID")"
+                echo "insights_activation_key: $(yq "$ACT_KEY")"
+                if [[ -n "$BUILDER_USER" ]]; then
+                    echo "rhsm_builder_username: $(yq "$BUILDER_USER")"
+                    echo "rhsm_builder_password: $(yq "$BUILDER_PASS")"
+                    echo "rhsm_builder_org_id: $(yq "$BUILDER_ORG")"
+                fi
+            } > "$tmp"
+            mv -f "$tmp" "$SECRETS_FILE"
             ok "Wrote secrets.yml (mode 0600, ignored by git)"
+
+            if ask_yn "Encrypt secrets.yml with ansible-vault? (recommended; you'll choose a vault password)" y; then
+                if ansible-vault encrypt "$SECRETS_FILE"; then
+                    ENCRYPTED=1
+                    ok "secrets.yml encrypted - edit it later with: ansible-vault edit secrets.yml"
+                else
+                    warn "Encryption failed; secrets.yml is still plain text (mode 0600)."
+                fi
+            fi
+        else
+            rm -f "$SECRETS_FILE"
+            ok "No credentials entered, so no secrets.yml (automatic registration stays off)"
         fi
+        unset BUILDER_PASS ACT_KEY
     fi
 fi
 

@@ -1,0 +1,9 @@
+---
+# Copy to settings.yml (ignored by git) and edit. No credentials here - those go
+# in secrets.yml. The playbooks load settings.yml automatically if it exists;
+# -e on the command line overrides it.
+deployment_mode: "podman"          # or "kvm"
+
+# How the image build gets RHEL content on a non-RHEL host - pick one:
+rhsm_builder_register: true        # fetch it with your Red Hat account (credentials in secrets.yml)
+# rhsm_secrets_dir: "/etc/goose/rhsm-secrets"   # ...or a folder copied from a registered RHEL system

@@ -15,11 +15,12 @@ This project contains an Ansible playbook that builds and deploys a Red Hat Ente
 ## Repository Layout
 
 ```
-bootstrap.sh                    # prepare a fresh host, write secrets.yml
+bootstrap.sh                    # prepare a fresh host, write settings.yml + secrets.yml
 deploy-goose-server.yml         # build and deploy
 teardown-goose-server.yml       # remove everything deploy created
 vars/goose.yml                  # shared settings for both playbooks
-secrets.example.yml             # template for local secrets.yml (git-ignored)
+settings.example.yml            # template for local settings.yml (plain, git-ignored)
+secrets.example.yml             # template for local secrets.yml (credentials only, git-ignored)
 templates/Containerfile.j2      # bootc image definition
 templates/config.toml.j2        # bootc-image-builder config (KVM admin user, disk size)
 templates/goose-node.container.j2  # Quadlet unit (Podman mode)
@@ -39,15 +40,18 @@ Run it as your normal user, not root. It uses `sudo` only to install packages. I
 
 1. **Checks dependencies:** `ansible-core` (at least 2.14), `podman`, `openssh-clients` and `python3`. It lists anything missing and offers to install it with `dnf`. It also warns if `/dev/kvm` is absent, since KVM mode needs it. The playbook installs the KVM packages itself.
 2. **Checks the `registry.redhat.io` login,** and offers to run `podman login` if you aren't logged in.
-3. **Asks for your settings and writes `secrets.yml`:**
+3. **Asks for your settings and credentials and writes two files:**
    - deployment mode;
    - Red Hat org ID and activation key, for the node's automatic registration;
    - how the image build gets RHEL content: your Red Hat account, a copied entitlement folder, or a registered RHEL host;
    - your Red Hat login, if you choose the account option without an activation key;
    - for KVM, it offers to create `~/.ssh/id_ed25519`.
 
-   Secrets are typed hidden, values are quoted safely for YAML, and the file is written with mode 0600. An existing `secrets.yml` is kept unless you choose to replace it, in which case it's backed up as `secrets.yml.bak-<timestamp>`, also git-ignored. Finally it offers to vault-encrypt the credential values. It encrypts each credential individually (inline `!vault` values) and leaves plain settings such as `deployment_mode` readable; see [Local settings and credentials](#local-settings-and-credentials-secretsyml) for why.
-4. **Prints the deploy and teardown commands** (adding `--ask-vault-pass` if the file contains vault-encrypted values) and offers to run the deploy.
+   - **`settings.yml`**: deployment mode and entitlement source, in plain text. The playbooks load it automatically.
+   - **`secrets.yml`**: org ID, activation key and builder login only. It's written with mode 0600, and the script offers to encrypt the whole file with `ansible-vault`.
+
+   Secrets are typed hidden and values are quoted safely for YAML. If an activation key name is short, or is part of text the project prints (such as `goose` or `node`), the script warns you; see [why](#local-settings-and-credentials). Existing files are kept unless you choose to replace them, in which case they're backed up as `<name>.bak-<timestamp>`, also git-ignored.
+4. **Prints the deploy and teardown commands** (adding `--ask-vault-pass` if `secrets.yml` is encrypted) and offers to run the deploy.
 
 Options: `-y` installs missing packages without asking; `--no-secrets` and `--no-login` skip those steps; `--allow-root` allows running as root. Everything below describes what the script sets up, if you'd rather do it by hand.
 
@@ -105,10 +109,15 @@ If you have a Red Hat account with subscriptions, the playbook can create the en
 4. Checks that your entitlement actually provides `goose-redhat` from `rhel-10-for-$(arch)-extensions-rpms`. If it doesn't, the run fails with a clear message.
 5. Exports `etc-pki-entitlement/`, `rhsm/` and `redhat.repo` to `rhsm_builder_dir/secrets`. The build mounts that exactly as it would a hand-made `rhsm_secrets_dir`.
 
-Credentials, in `secrets.yml`. Use **one** of these:
+Turn it on in `settings.yml`:
 
 ```yaml
 rhsm_builder_register: true
+```
+
+Then put the credentials in `secrets.yml`. Use **one** of these:
+
+```yaml
 # a) activation key + org ID: defaults to insights_org_id / insights_activation_key,
 #    so if those are already set there's nothing else to add
 # b) Red Hat login (add rhsm_builder_org_id if your account belongs to several orgs):
@@ -124,7 +133,7 @@ The builder shows up in your Red Hat account as one system, `goose-image-builder
 
 ## Configuration
 
-Set variables in `vars/goose.yml`, or pass them with `-e`. Both the deploy and teardown playbooks load this file, so they always agree on names and paths. If you override `vm_name`, `image_name`, `build_dir` and so on with `-e` when deploying, pass the same overrides to teardown.
+Set variables in `vars/goose.yml` (committed defaults), in your local `settings.yml` (git-ignored, loaded automatically and overriding the defaults), or with `-e` (overrides both). Both the deploy and teardown playbooks load these files, so they always agree on names and paths. If you override `vm_name`, `image_name`, `build_dir` and so on with `-e` when deploying, pass the same overrides to teardown.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -164,34 +173,31 @@ ansible-playbook deploy-goose-server.yml -K \
   -e deployment_mode=kvm \
   -e rhsm_secrets_dir=/etc/goose/rhsm-secrets
 
-# Using your local settings/credentials file (see below)
-ansible-playbook deploy-goose-server.yml -K -e @secrets.yml
+# Using your local settings and credentials (see below): settings.yml is loaded
+# automatically; pass the credentials file explicitly
+ansible-playbook deploy-goose-server.yml -K -e @secrets.yml --ask-vault-pass
 ```
 
-### Local settings and credentials (`secrets.yml`)
+### Local settings and credentials
 
-Keep machine-specific settings and registration credentials in `secrets.yml`. It's listed in `.gitignore`, so it is **never committed**. Never put real credentials in `vars/goose.yml`.
+Two git-ignored files hold everything that's specific to your machine. `bootstrap.sh` writes both for you; to create them by hand, start from the examples:
+
+| File | Contents | Protection | How it's used |
+|---|---|---|---|
+| `settings.yml` | `deployment_mode`, `rhsm_builder_register` or `rhsm_secrets_dir` | Plain text | Loaded automatically by both playbooks if it exists; `-e` overrides it |
+| `secrets.yml` | `insights_org_id`, `insights_activation_key`, optional `rhsm_builder_username`/`password`/`org_id` | Mode 0600, encrypted with `ansible-vault` | `-e @secrets.yml --ask-vault-pass` |
 
 ```bash
-cp secrets.example.yml secrets.yml && chmod 600 secrets.yml
-$EDITOR secrets.yml
+cp settings.example.yml settings.yml && $EDITOR settings.yml
+cp secrets.example.yml secrets.yml && chmod 600 secrets.yml && $EDITOR secrets.yml
+ansible-vault encrypt secrets.yml          # later: ansible-vault edit secrets.yml
 ```
 
-```yaml
-rhsm_secrets_dir: "/etc/goose/rhsm-secrets"   # only needed on non-RHEL build hosts
-insights_org_id: "1234567"
-insights_activation_key: "goose-node-key"
-```
+Never put real credentials in `vars/goose.yml`, which is committed.
 
-To keep the credentials encrypted at rest, **encrypt the values, not the whole file**, then add `--ask-vault-pass` to each run. `bootstrap.sh` does this for you. To do it by hand:
+**Why two files.** Since ansible-core 2.22, Ansible registers every value of a vault-encrypted vars file as a secret and replaces that text with `$REDACTED$` **wherever it appears in output**, whatever produced it. If `deployment_mode: podman` sat in the encrypted file, every `podman` in the output, including the connection instructions, would turn into `$REDACTED$`. So only credentials go in `secrets.yml`.
 
-```bash
-printf %s 'my-activation-key' | ansible-vault encrypt_string --stdin-name insights_activation_key
-```
-
-Paste the output into `secrets.yml` in place of the plain line, using the same vault password for every value.
-
-Don't run `ansible-vault encrypt secrets.yml` on the whole file. Since ansible-core 2.22, Ansible registers *every* string in a vault-encrypted vars file as a secret and redacts it wherever it appears in output, so `deployment_mode: podman` turns every `podman` in the playbook output, including the connection instructions, into `$REDACTED$`. Values encrypted inline are redacted the same way, which is exactly what you want for credentials.
+The same rule covers the credentials themselves: a value is redacted wherever its full text appears. Choose an activation key name that is specific (`goose-demo-node-2026`) rather than short or generic (`goose`, `admin`, `node`). Otherwise unrelated output such as `goose-proxy` is garbled into `$REDACTED$-proxy`.
 
 `-K` prompts for your sudo password. The play escalates to root to build images, write to `/etc` and manage libvirt.
 
@@ -311,7 +317,7 @@ ansible-playbook deploy-goose-server.yml   -K -e @secrets.yml
 
 ## Troubleshooting
 
-* **Output shows `$REDACTED$` instead of `podman` (or a path, or `kvm`):** your `secrets.yml` is vault-encrypted as a whole file, so ansible-core 2.22+ treats every value in it as a secret. Re-run `./bootstrap.sh` and choose to replace `secrets.yml`; the old file is kept as a backup. It writes the credentials as individual `!vault` values and leaves the settings in plain text. See [Local settings and credentials](#local-settings-and-credentials-secretsyml).
+* **Output shows `$REDACTED$` in place of `podman`, `kvm`, a path or other ordinary text:** something in your vault-encrypted `secrets.yml` matches that text. Either a setting is in the encrypted file (the older single-file layout), or an activation key name is short or generic. Re-run `./bootstrap.sh` and choose to replace the files. It splits the settings into `settings.yml`, keeps the old files as backups, and warns about clashing key names. See [Local settings and credentials](#local-settings-and-credentials).
 
 * **`No working registry.redhat.io login found`:** run `podman login registry.redhat.io`. The error includes Podman's own message. Logins stored under `/run/...` are cleared on reboot, so log in again after restarting.
 * **`No match for argument: goose-redhat` / repo errors during the build:** the build can't see RHEL repositories. On RHEL, check `sudo subscription-manager repos --list-enabled`. On other hosts, check the `rhsm_secrets_dir` contents and how old the certificates are.
