@@ -40,6 +40,9 @@
         daemon_reload: true
 
   pre_tasks:
+    - name: Detect the host platform and load its settings
+      ansible.builtin.include_tasks: tasks/host-platform.yml
+
     - name: Load local settings (settings.yml), if present
       # Plain, git-ignored settings written by bootstrap.sh (deployment_mode,
       # entitlement source). Credentials stay in secrets.yml (-e @secrets.yml);

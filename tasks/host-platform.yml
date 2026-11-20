@@ -1,0 +1,33 @@
+---
+# Detect the host platform and load its host-specific settings from
+# vars/host/<platform>.yml. Included first by both playbooks.
+#
+# To add a platform: map its Ansible os_family below and create
+# vars/host/<platform>.yml defining the host_* variables used by the playbooks
+# (see vars/host/fedora_rhel.yml).
+
+- name: Gather the minimal facts needed to detect the host platform
+  when: ansible_facts['os_family'] is not defined
+  ansible.builtin.setup:
+    gather_subset: [min]
+
+- name: Detect the host platform
+  ansible.builtin.set_fact:
+    host_platform: "{{ host_platforms_by_os_family[ansible_facts['os_family']] | default('unsupported') }}"
+    host_is_wsl: "{{ 'microsoft' in (ansible_facts['kernel'] | default('') | lower) }}"
+  vars:
+    host_platforms_by_os_family:
+      RedHat: fedora_rhel
+
+- name: Stop on an unsupported host platform
+  when: host_platform == 'unsupported'
+  ansible.builtin.fail:
+    msg: >-
+      This host ({{ ansible_facts['distribution'] | default('unknown') }}
+      {{ ansible_facts['distribution_version'] | default('') }}, os_family
+      {{ ansible_facts['os_family'] | default('unknown') }}) is not supported yet.
+      Supported: Fedora and RHEL-family Linux.
+
+- name: Load host platform settings (vars/host/<platform>.yml) for {{ host_platform }}
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/vars/host/{{ host_platform }}.yml"

@@ -79,7 +79,6 @@ registration_enabled: "{{ (insights_org_id | length > 0) and (insights_activatio
 credstore_dir: "{{ build_dir }}/credstore"
 rhsm_secrets_dir_effective: "{{ (rhsm_builder_dir ~ '/secrets') if (rhsm_builder_register | bool) else rhsm_secrets_dir }}"
 vm_disk_path: "{{ libvirt_image_dir }}/{{ vm_name }}.qcow2"
-kvm_packages:
-  - libvirt
-  - virt-install
-  - qemu-kvm
+# Host-specific package list from vars/host/<platform>.yml; replace with a
+# literal list here to override it.
+kvm_packages: "{{ host_kvm_packages }}"

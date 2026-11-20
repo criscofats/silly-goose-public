@@ -11,6 +11,9 @@
     - vars/goose.yml
 
   pre_tasks:
+    - name: Detect the host platform and load its settings
+      ansible.builtin.include_tasks: tasks/host-platform.yml
+
     - name: Load local settings (settings.yml), if present
       # Plain, git-ignored settings written by bootstrap.sh (deployment_mode,
       # entitlement source). Credentials stay in secrets.yml (-e @secrets.yml);
@@ -39,7 +42,7 @@
 
     - name: Ensure deployment dependencies are installed
       ansible.builtin.package:
-        name: "{{ ['podman'] + (kvm_packages if deployment_mode == 'kvm' else []) }}"
+        name: "{{ host_container_packages + (kvm_packages if deployment_mode == 'kvm' else []) }}"
         state: present
 
     - name: Check registry.redhat.io credentials (root login, then user auth files)
@@ -196,16 +199,13 @@
               and redhat.repo. Missing:
               {{ rhsm_secrets_stat.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}
 
-    - name: Ensure modular libvirt daemons are enabled and running (KVM mode)
+    - name: Ensure the libvirt daemons are enabled and running (KVM mode)
       when: deployment_mode == 'kvm'
       ansible.builtin.systemd_service:
         name: "{{ item }}"
         state: started
         enabled: true
-      loop:
-        - virtqemud.socket
-        - virtnetworkd.socket
-        - virtstoraged.socket
+      loop: "{{ host_libvirt_services }}"
 
     - name: Ensure libvirt network is active and autostarted (KVM mode)
       when: deployment_mode == 'kvm'
