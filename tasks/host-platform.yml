@@ -18,6 +18,9 @@
   vars:
     host_platforms_by_os_family:
       RedHat: fedora_rhel
+      Debian: debian        # Debian, Ubuntu
+      Suse: suse            # openSUSE, SLES
+      Archlinux: archlinux
 
 - name: Stop on an unsupported host platform
   when: host_platform == 'unsupported'
@@ -26,7 +29,7 @@
       This host ({{ ansible_facts['distribution'] | default('unknown') }}
       {{ ansible_facts['distribution_version'] | default('') }}, os_family
       {{ ansible_facts['os_family'] | default('unknown') }}) is not supported yet.
-      Supported: Fedora and RHEL-family Linux.
+      Supported: Fedora/RHEL-family, Debian/Ubuntu, openSUSE/SLES and Arch Linux.
 
 - name: Load host platform settings (vars/host/<platform>.yml) for {{ host_platform }}
   ansible.builtin.include_vars:

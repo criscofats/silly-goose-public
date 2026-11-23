@@ -17,3 +17,9 @@ host_libvirt_services:
   - virtqemud.socket
   - virtnetworkd.socket
   - virtstoraged.socket
+
+# dnf manages its own metadata cache.
+host_package_update_cache: false
+
+# Ansible module behind ansible.builtin.package on this host ("" = built in).
+host_package_module: ""

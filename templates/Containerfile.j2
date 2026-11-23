@@ -31,7 +31,7 @@ COPY goose-register.service /usr/lib/systemd/system/goose-register.service
 COPY goose-verify.sh /usr/libexec/goose-verify
 RUN chmod 0755 /usr/libexec/goose-register /usr/libexec/goose-verify && \
     systemctl enable goose-register.service
-{% if admin_sudo_nopasswd %}
+{% if admin_sudo_nopasswd | bool %}
 
 # Admin user is key-only (no password), so allow wheel to sudo without one.
 RUN echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/90-wheel-nopasswd && \

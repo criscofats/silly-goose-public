@@ -31,7 +31,7 @@ files/goose-register.{sh,service}  # first-boot RHSM + Insights registration
 
 ## Quick start on a fresh host
 
-`bootstrap.sh` prepares a fresh Fedora or RHEL-family install so you can deploy straight away:
+`bootstrap.sh` prepares a fresh install of any [supported Linux host](#supported-host-platforms) so you can deploy straight away:
 
 ```bash
 git clone https://github.com/criscofats/silly-goose-public.git && cd silly-goose-public
@@ -40,7 +40,7 @@ git clone https://github.com/criscofats/silly-goose-public.git && cd silly-goose
 
 Run it as your normal user, not root. It uses `sudo` only to install packages. It:
 
-1. **Checks dependencies:** `ansible-core` (at least 2.14), `podman`, `openssh-clients` and `python3`. It lists anything missing and offers to install it with `dnf`. It also warns if `/dev/kvm` is absent, since KVM mode needs it. The playbook installs the KVM packages itself.
+1. **Checks dependencies:** Ansible (`ansible-core` at least 2.14, or the full `ansible` package on openSUSE and Arch), `podman`, the OpenSSH client and `python3`. It lists anything missing and offers to install it with the host's package manager (`dnf`, `apt-get`, `zypper` or `pacman`). It also warns if `/dev/kvm` is absent, since KVM mode needs it. The playbook installs the KVM packages itself.
 2. **Checks the `registry.redhat.io` login,** and offers to run `podman login` if you aren't logged in.
 3. **Asks for your settings and credentials and writes two files:**
    - deployment mode;
@@ -61,21 +61,28 @@ Options: `-y` installs missing packages without asking; `--no-secrets` and `--no
 
 | Platform | Status | Notes |
 |---|---|---|
-| Fedora, RHEL, CentOS Stream and other RHEL-family Linux | Supported | `dnf`, systemd, SELinux, modular libvirt daemons |
-| Other Linux distributions, Windows (WSL2), macOS | Planned | Work in progress on feature branches |
+| Fedora, RHEL, CentOS Stream and other RHEL-family Linux | Supported, fully tested | `dnf`, SELinux, modular libvirt daemons |
+| Debian 13 and newer, Ubuntu 24.04 and newer | Supported | `apt-get`, AppArmor, `libvirtd`. Ubuntu 24.04 ships ansible-core 2.16, which works |
+| openSUSE Tumbleweed / Leap 16, SLES | Supported | `zypper`, modular libvirt daemons. Needs the full `ansible` package (`community.general`) |
+| Arch Linux | Supported | `pacman`, modular libvirt daemons. Needs the full `ansible` package; `bootstrap.sh` installs with `pacman -Syu`, which also upgrades the system |
+| Windows (WSL2), macOS | Planned | Work in progress on feature branches |
+
+**Podman mode needs Podman 4.4 or newer** (Quadlet). The deploy checks this and stops with a clear message on older releases such as Debian 12 (Podman 4.3); use a newer release or `deployment_mode=kvm` there.
+
+**What has been tested on the newer platforms:** in fresh containers of Debian 13, Ubuntu 24.04, openSUSE Tumbleweed and Arch, `bootstrap.sh` installed the dependencies, and the deploy detected the platform, installed Podman and every KVM package by its real name, and passed the Podman version check. Debian 12 was refused as intended, and teardown completed. A full deploy (image build, VM or container start, goose verification) has only been run on Fedora; on the others it's expected to work, since those steps happen inside containers and the RHEL image, but it hasn't been verified yet.
 
 The playbooks and `bootstrap.sh` detect the host and stop with a clear message on anything else. Everything host-specific sits in one place, so adding a platform is mostly additive:
 
 1. **Playbooks:** map the host's Ansible `os_family` to a platform name in `tasks/host-platform.yml`, then create `vars/host/<platform>.yml` with the `host_*` variables (copy `vars/host/fedora_rhel.yml`). `host_is_wsl` is already detected for platforms that need to tell WSL apart.
-2. **`bootstrap.sh`:** add a `case` entry in the host platform section that sets `PLATFORM`, `PKG_MGR` and the `PKG_FOR` map from command to package.
+2. **`bootstrap.sh`:** add a `case` entry in the host platform section that sets `PLATFORM`, `PKG_MGR`, `PKG_INSTALL` (and `PKG_REFRESH` if the index needs refreshing), `ADMIN_GROUP`, and the `PKG_FOR` map from command to package.
 
 The image build, registration and goose verification are shared by every platform.
 
 ## Prerequisites
 
-The playbook installs everything else for you (`podman`, plus `libvirt`, `virt-install` and `qemu-kvm` in KVM mode) and starts the libvirt daemons and network. You need to provide:
+The playbook installs everything else for you (`podman`, plus the libvirt, `virt-install` and QEMU packages for your platform in KVM mode) and starts the libvirt daemons and network. You need to provide:
 
-1. **Ansible:** `sudo dnf install ansible-core`
+1. **Ansible:** `./bootstrap.sh` installs it. By hand: `sudo dnf install ansible-core` (Fedora/RHEL), `sudo apt-get install ansible-core` (Debian/Ubuntu), `sudo zypper install ansible` (openSUSE) or `sudo pacman -S ansible` (Arch).
 2. **Registry login:** log in to `registry.redhat.io` as your normal user or as root:
    ```bash
    podman login registry.redhat.io
@@ -83,7 +90,7 @@ The playbook installs everything else for you (`podman`, plus `libvirt`, `virt-i
    The playbook runs Podman as root. It uses root's own login if there is one. Otherwise it falls back to your user's auth files (`$XDG_RUNTIME_DIR/containers/auth.json`, `~/.config/containers/auth.json`, `~/.docker/config.json`) and passes the one that works to every Podman command through `REGISTRY_AUTH_FILE`. To use a specific file, set `registry_authfile`.
 3. **RHEL content entitlement for the image build:** the build has to install packages from RHEL repositories.
    * **Registered RHEL host:** nothing to do. Podman passes the host's entitlement into the build automatically.
-   * **Any other host (Fedora, etc.):** see [Building on a non-RHEL host](#building-on-a-non-rhel-host). Either copy entitlement files from a registered RHEL system (`rhsm_secrets_dir`), or let the playbook fetch them with your Red Hat account (`rhsm_builder_register`).
+   * **Any other host (Fedora, Debian, Ubuntu, openSUSE, Arch, ...):** see [Building on a non-RHEL host](#building-on-a-non-rhel-host). Either copy entitlement files from a registered RHEL system (`rhsm_secrets_dir`), or let the playbook fetch them with your Red Hat account (`rhsm_builder_register`).
 4. **SSH key (KVM mode only):** by default the playbook reads `~/.ssh/id_ed25519.pub` and adds it for the `goose` admin user. Override this with `admin_ssh_pubkey_file` or `admin_ssh_pubkey`.
 
 ### Building on a non-RHEL host

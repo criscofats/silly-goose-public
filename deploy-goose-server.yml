@@ -40,10 +40,45 @@
           admin_ssh_pubkey_file or admin_ssh_pubkey, otherwise the VM will have
           no usable login.
 
+    - name: Check the Ansible package module for this host is available
+      when: host_package_module | length > 0
+      become: false
+      # ansible-doc exits 0 even for unknown modules; -j prints {} when it's missing.
+      ansible.builtin.command: ansible-doc -j -t module {{ host_package_module }}
+      register: package_module_doc
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the package module is missing
+      when: >-
+        host_package_module | length > 0 and
+        host_package_module not in (package_module_doc.stdout | default('{}', true) | from_json)
+      ansible.builtin.fail:
+        msg: >-
+          This host's package manager needs the {{ host_package_module }} Ansible module.
+          Install the full "ansible" package (it includes the community.general
+          collection) or run: ansible-galaxy collection install community.general
+
     - name: Ensure deployment dependencies are installed
       ansible.builtin.package:
         name: "{{ host_container_packages + (kvm_packages if deployment_mode == 'kvm' else []) }}"
         state: present
+        update_cache: "{{ host_package_update_cache }}"
+
+    - name: Check the Podman version (Podman mode runs as a Quadlet unit, Podman 4.4 or newer)
+      when: deployment_mode == 'podman'
+      ansible.builtin.command: podman --version
+      register: podman_version
+      changed_when: false
+
+    - name: Fail if Podman is too old for Quadlet
+      when: deployment_mode == 'podman'
+      ansible.builtin.assert:
+        that: podman_version.stdout.split()[-1] is version('4.4', '>=')
+        fail_msg: >-
+          {{ podman_version.stdout }} is too old: Podman mode needs Podman 4.4 or newer
+          (Quadlet). Use a newer distribution release (e.g. Debian 13, Ubuntu 24.04) or
+          deployment_mode=kvm.
 
     - name: Check registry.redhat.io credentials (root login, then user auth files)
       ansible.builtin.command:
@@ -259,7 +294,7 @@
       ansible.builtin.command:
         argv: >-
           {{ ['podman', 'build', '--pull=newer']
-             + (['--no-cache'] if build_no_cache else [])
+             + (['--no-cache'] if build_no_cache | bool else [])
              + (['-v', rhsm_secrets_dir_effective ~ ':/run/secrets:ro,z'] if rhsm_secrets_dir_effective else [])
              + ['-t', image_ref, '-f', 'Containerfile', '.'] }}
         chdir: "{{ build_dir }}"
@@ -279,20 +314,20 @@
 
     - name: Report image build result
       ansible.builtin.debug:
-        msg: "{{ image_ref }} -> {{ image_id[:12] }} ({{ 'rebuilt' if image_changed else 'unchanged' }})"
-      changed_when: image_changed
+        msg: "{{ image_ref }} -> {{ image_id[:12] }} ({{ 'rebuilt' if image_changed | bool else 'unchanged' }})"
+      changed_when: (image_changed | bool)
 
     - name: Push image to registry
       when: image_registry | length > 0
       ansible.builtin.command: podman push {{ image_ref }}
-      changed_when: image_changed
+      changed_when: (image_changed | bool)
 
     # ----------------------------------------------------------------- podman
     - name: Podman deployment
       when: deployment_mode == 'podman'
       block:
         - name: Write registration credentials to credstore
-          when: registration_enabled
+          when: (registration_enabled | bool)
           block:
             - name: Ensure credstore directory exists
               ansible.builtin.file:
@@ -337,7 +372,7 @@
                  else 'started' }}
 
         - name: Wait for the container to finish booting (includes first-boot registration)
-          when: goose_verify
+          when: (goose_verify | bool)
           ansible.builtin.command: podman exec {{ vm_name }} systemctl is-system-running --wait
           register: container_boot
           until: container_boot.stdout in ['running', 'degraded']
@@ -347,14 +382,14 @@
           failed_when: false
 
         - name: Verify goose uses the RHEL command-line assistant backend
-          when: goose_verify
+          when: (goose_verify | bool)
           ansible.builtin.command: podman exec {{ vm_name }} /usr/libexec/goose-verify
           register: goose_verify_result
           changed_when: false
           failed_when: goose_verify_result.rc not in [0, 2]
 
         - name: Report goose backend verification
-          when: goose_verify
+          when: (goose_verify | bool)
           ansible.builtin.debug:
             msg: "{{ goose_verify_result.stdout_lines }}"
 
@@ -386,7 +421,7 @@
             disk_stale: "{{ bib_config.changed or disk_image_id.rc != 0 or disk_image_id.stdout != image_id }}"
 
         - name: Regenerate qcow2 disk
-          when: disk_stale
+          when: (disk_stale | bool)
           block:
             - name: Remove stale disk output
               ansible.builtin.file:
@@ -428,7 +463,7 @@
           failed_when: false
 
         - name: Remove existing VM (vm_recreate=true)
-          when: vm_info.rc == 0 and vm_recreate
+          when: vm_info.rc == 0 and (vm_recreate | bool)
           block:
             - name: Stop VM
               ansible.builtin.command: virsh destroy {{ vm_name }}
@@ -441,7 +476,7 @@
               changed_when: true
 
         - name: Install VM
-          when: vm_info.rc != 0 or vm_recreate
+          when: vm_info.rc != 0 or (vm_recreate | bool)
           block:
             - name: Copy disk into libvirt image directory
               ansible.builtin.command:
@@ -461,12 +496,12 @@
                          'type=smbios'
                          ~ ',oemStrings.entry0=io.systemd.credential:goose.org_id=' ~ insights_org_id
                          ~ ',oemStrings.entry1=io.systemd.credential:goose.activation_key=' ~ insights_activation_key]
-                        if registration_enabled else []) }}
+                        if registration_enabled | bool else []) }}
               changed_when: true
-              no_log: "{{ registration_enabled }}"
+              no_log: "{{ registration_enabled | bool }}"
 
         - name: Warn that the running VM was not updated
-          when: vm_info.rc == 0 and not vm_recreate and disk_stale
+          when: vm_info.rc == 0 and not (vm_recreate | bool) and (disk_stale | bool)
           ansible.builtin.debug:
             msg: >-
               {{ vm_name }} already exists and was left untouched. Update it in
@@ -483,7 +518,7 @@
           failed_when: false
 
         - name: Verify goose uses the RHEL command-line assistant backend (over SSH)
-          when: goose_verify and vm_addr.stdout is search('ipv4')
+          when: (goose_verify | bool) and vm_addr.stdout is search('ipv4')
           become: false   # use the invoking user's SSH key
           ansible.builtin.command:
             argv:
@@ -506,7 +541,7 @@
           failed_when: goose_verify_result.rc not in [0, 2]
 
         - name: Report goose backend verification
-          when: goose_verify and goose_verify_result is not skipped
+          when: (goose_verify | bool) and goose_verify_result is not skipped
           ansible.builtin.debug:
             msg: "{{ goose_verify_result.stdout_lines }}"
 

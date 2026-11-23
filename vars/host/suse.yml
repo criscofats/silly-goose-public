@@ -1,0 +1,24 @@
+---
+# Host settings for openSUSE Tumbleweed / Leap and SLES (zypper, systemd,
+# modular libvirt daemons). Tested package names: openSUSE Tumbleweed.
+
+host_container_packages:
+  - podman
+
+host_kvm_packages:
+  - libvirt-daemon-qemu
+  - libvirt-daemon-config-network
+  - libvirt-client
+  - virt-install
+  - "qemu-{{ 'arm' if ansible_facts['architecture'] == 'aarch64' else 'x86' }}"
+
+host_libvirt_services:
+  - virtqemud.socket
+  - virtnetworkd.socket
+  - virtstoraged.socket
+
+host_package_update_cache: false
+
+# ansible.builtin.package uses zypper from the community.general collection,
+# which the full "ansible" package includes (ansible-core alone does not).
+host_package_module: community.general.zypper
