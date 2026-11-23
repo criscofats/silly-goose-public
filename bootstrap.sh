@@ -132,46 +132,63 @@ fi
 SUDO="sudo"
 [[ $EUID -eq 0 ]] && SUDO=""
 
-[[ -r /etc/os-release ]] || die "Cannot read /etc/os-release; unsupported system."
-# shellcheck source=/dev/null
-. /etc/os-release
-OS_ID="${ID:-unknown}"
-OS_LIKE="${ID_LIKE:-}"
+# ------------------------------------------------------- host platform
+# Each supported platform defines (add a platform with another case below, plus
+# vars/host/<platform>.yml for the playbooks):
+#   PLATFORM  name, matching vars/host/<platform>.yml
+#   PKG_MGR   package manager, used as: PKG_MGR install -y <packages>
+#   PKG_FOR   command -> package that provides it
+PLATFORM="unsupported"
+PKG_MGR=""
+declare -A PKG_FOR=()
+OS_ID="unknown"; OS_LIKE=""; OS_NAME="$(uname -s)"
+if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"; OS_LIKE="${ID_LIKE:-}"; OS_NAME="${PRETTY_NAME:-$OS_ID}"
+fi
 case " $OS_ID $OS_LIKE " in
-    *" fedora "*|*" rhel "*|*" centos "*) ok "Supported OS: ${PRETTY_NAME:-$OS_ID}" ;;
-    *) die "Unsupported OS '${PRETTY_NAME:-$OS_ID}'. This project supports Fedora and RHEL-family hosts (dnf)." ;;
+    *" fedora "*|*" rhel "*|*" centos "*)
+        PLATFORM="fedora_rhel"
+        PKG_MGR="dnf"
+        PKG_FOR=([python3]=python3 [ansible-playbook]=ansible-core [podman]=podman
+                 [ssh]=openssh-clients [ssh-keygen]=openssh-clients)
+        ;;
 esac
-command -v dnf >/dev/null 2>&1 || die "dnf not found."
+[[ "$PLATFORM" != unsupported ]] \
+    || die "Unsupported OS '${OS_NAME}'. This project supports Fedora and RHEL-family hosts (dnf)."
+ok "Supported OS: ${OS_NAME}"
+command -v "$PKG_MGR" >/dev/null 2>&1 || die "${PKG_MGR} not found."
 IS_RHEL=0
 [[ "$OS_ID" == "rhel" ]] && IS_RHEL=1
 
 if [[ -n "$SUDO" ]] && ! command -v sudo >/dev/null 2>&1; then
-    die "sudo is not installed. Install it as root (dnf install sudo) and add your user to the wheel group."
+    die "sudo is not installed. Install it as root (${PKG_MGR} install sudo) and add your user to the wheel group."
 fi
 
 # --------------------------------------------------------- dependencies
 step "Checking dependencies"
 
 declare -a MISSING=()
-check_cmd() {   # check_cmd <command> <package> <why>
+check_cmd() {   # check_cmd <command> <why>; package comes from PKG_FOR
     if command -v "$1" >/dev/null 2>&1; then
-        ok "$1 ($3)"
+        ok "$1 ($2)"
     else
-        warn "$1 missing ($3) -> package $2"
-        MISSING+=("$2")
+        warn "$1 missing ($2) -> package ${PKG_FOR[$1]}"
+        MISSING+=("${PKG_FOR[$1]}")
     fi
 }
-check_cmd python3          python3          "runs Ansible"
-check_cmd ansible-playbook ansible-core     "runs the playbooks"
-check_cmd podman           podman           "registry login, image build"
-check_cmd ssh              openssh-clients  "KVM verification/teardown over SSH"
-check_cmd ssh-keygen       openssh-clients  "creates the KVM admin SSH key"
+check_cmd python3          "runs Ansible"
+check_cmd ansible-playbook "runs the playbooks"
+check_cmd podman           "registry login, image build"
+check_cmd ssh              "KVM verification/teardown over SSH"
+check_cmd ssh-keygen       "creates the KVM admin SSH key"
 
 if command -v ansible-playbook >/dev/null 2>&1; then
     ver="$(ansible-playbook --version 2>/dev/null | sed -nE '1s/.*core ([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p')"
     if [[ -n "$ver" ]] && ! version_ge "$ver" "$MIN_ANSIBLE_CORE"; then
         warn "ansible-core $ver is older than $MIN_ANSIBLE_CORE -> will offer to upgrade"
-        MISSING+=("ansible-core")
+        MISSING+=("${PKG_FOR[ansible-playbook]}")
     elif [[ -n "$ver" ]]; then
         ok "ansible-core $ver (>= $MIN_ANSIBLE_CORE)"
     fi
@@ -181,12 +198,12 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     mapfile -t MISSING < <(printf '%s\n' "${MISSING[@]}" | sort -u)
     echo
     echo "  Missing: ${MISSING[*]}"
-    if [[ $ASSUME_YES -eq 1 ]] || ask_yn "Install them now with '${SUDO:+sudo }dnf install ${MISSING[*]}'?" y; then
-        if ! $SUDO dnf install -y "${MISSING[@]}"; then
+    if [[ $ASSUME_YES -eq 1 ]] || ask_yn "Install them now with '${SUDO:+sudo }${PKG_MGR} install ${MISSING[*]}'?" y; then
+        if ! $SUDO "$PKG_MGR" install -y "${MISSING[@]}"; then
             if [[ $IS_RHEL -eq 1 ]]; then
-                die "dnf failed. On RHEL these packages come from BaseOS/AppStream: make sure the host is registered (sudo subscription-manager register) and try again."
+                die "${PKG_MGR} failed. On RHEL these packages come from BaseOS/AppStream: make sure the host is registered (sudo subscription-manager register) and try again."
             fi
-            die "dnf failed; install the packages above manually and re-run."
+            die "${PKG_MGR} failed; install the packages above manually and re-run."
         fi
         ok "Installed: ${MISSING[*]}"
     else
