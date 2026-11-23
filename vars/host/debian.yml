@@ -1,0 +1,24 @@
+---
+# Host settings for Debian and Ubuntu (apt, systemd, AppArmor, monolithic
+# libvirtd). Tested package names: Debian 13, Ubuntu 24.04.
+# Podman mode needs Podman >= 4.4 (Quadlet): Debian 13 / Ubuntu 24.04 or newer.
+
+host_container_packages:
+  - podman
+
+host_kvm_packages:
+  - libvirt-daemon-system
+  - libvirt-daemon-config-network
+  - virtinst
+  - "qemu-system-{{ 'arm' if ansible_facts['architecture'] == 'aarch64' else 'x86' }}"
+  - qemu-utils
+  - dnsmasq-base
+
+host_libvirt_services:
+  - libvirtd.service
+
+# Refresh the apt index before installing (a fresh install has none).
+host_package_update_cache: true
+
+# Ansible module behind ansible.builtin.package on this host ("" = built in).
+host_package_module: ""

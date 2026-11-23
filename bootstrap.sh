@@ -135,11 +135,17 @@ SUDO="sudo"
 # ------------------------------------------------------- host platform
 # Each supported platform defines (add a platform with another case below, plus
 # vars/host/<platform>.yml for the playbooks):
-#   PLATFORM  name, matching vars/host/<platform>.yml
-#   PKG_MGR   package manager, used as: PKG_MGR install -y <packages>
-#   PKG_FOR   command -> package that provides it
+#   PLATFORM     name, matching vars/host/<platform>.yml
+#   PKG_MGR      package manager command (must exist on the host)
+#   PKG_INSTALL  install command; packages are appended
+#   PKG_REFRESH  optional command run first to refresh the package index
+#   PKG_FOR      command -> package that provides it
+#   ADMIN_GROUP  group that grants sudo
 PLATFORM="unsupported"
 PKG_MGR=""
+PKG_INSTALL=()
+PKG_REFRESH=()
+ADMIN_GROUP="wheel"
 declare -A PKG_FOR=()
 OS_ID="unknown"; OS_LIKE=""; OS_NAME="$(uname -s)"
 if [[ -r /etc/os-release ]]; then
@@ -151,19 +157,46 @@ case " $OS_ID $OS_LIKE " in
     *" fedora "*|*" rhel "*|*" centos "*)
         PLATFORM="fedora_rhel"
         PKG_MGR="dnf"
+        PKG_INSTALL=(dnf install -y)
         PKG_FOR=([python3]=python3 [ansible-playbook]=ansible-core [podman]=podman
                  [ssh]=openssh-clients [ssh-keygen]=openssh-clients)
         ;;
+    *" debian "*|*" ubuntu "*)
+        PLATFORM="debian"
+        PKG_MGR="apt-get"
+        PKG_REFRESH=(apt-get update)
+        PKG_INSTALL=(env DEBIAN_FRONTEND=noninteractive apt-get install -y)
+        ADMIN_GROUP="sudo"
+        PKG_FOR=([python3]=python3 [ansible-playbook]=ansible-core [podman]=podman
+                 [ssh]=openssh-client [ssh-keygen]=openssh-client)
+        ;;
+    *" suse "*|*" opensuse "*)
+        PLATFORM="suse"
+        PKG_MGR="zypper"
+        PKG_INSTALL=(zypper --non-interactive install)
+        # full "ansible": its community.general collection provides the zypper module
+        PKG_FOR=([python3]=python3 [ansible-playbook]=ansible [podman]=podman
+                 [ssh]=openssh-clients [ssh-keygen]=openssh-clients)
+        ;;
+    *" arch "*)
+        PLATFORM="archlinux"
+        PKG_MGR="pacman"
+        # Arch doesn't support partial upgrades, so syncing also upgrades the system.
+        PKG_INSTALL=(pacman -Syu --needed --noconfirm)
+        # full "ansible": its community.general collection provides the pacman module
+        PKG_FOR=([python3]=python [ansible-playbook]=ansible [podman]=podman
+                 [ssh]=openssh [ssh-keygen]=openssh)
+        ;;
 esac
 [[ "$PLATFORM" != unsupported ]] \
-    || die "Unsupported OS '${OS_NAME}'. This project supports Fedora and RHEL-family hosts (dnf)."
+    || die "Unsupported OS '${OS_NAME}'. Supported: Fedora/RHEL-family, Debian/Ubuntu, openSUSE/SLES and Arch Linux."
 ok "Supported OS: ${OS_NAME}"
 command -v "$PKG_MGR" >/dev/null 2>&1 || die "${PKG_MGR} not found."
 IS_RHEL=0
 [[ "$OS_ID" == "rhel" ]] && IS_RHEL=1
 
 if [[ -n "$SUDO" ]] && ! command -v sudo >/dev/null 2>&1; then
-    die "sudo is not installed. Install it as root (${PKG_MGR} install sudo) and add your user to the wheel group."
+    die "sudo is not installed. Install it as root (${PKG_INSTALL[*]} sudo) and add your user to the ${ADMIN_GROUP} group."
 fi
 
 # --------------------------------------------------------- dependencies
@@ -194,12 +227,32 @@ if command -v ansible-playbook >/dev/null 2>&1; then
     fi
 fi
 
+# zypper/pacman hosts: ansible.builtin.package needs community.general's module.
+case "$PLATFORM" in
+    suse) PKG_MODULE="community.general.zypper" ;;
+    archlinux) PKG_MODULE="community.general.pacman" ;;
+    *) PKG_MODULE="" ;;
+esac
+if [[ -n "$PKG_MODULE" ]] && command -v ansible-doc >/dev/null 2>&1; then
+    # ansible-doc exits 0 even for unknown modules; -j prints {} when it's missing.
+    if ansible-doc -j -t module "$PKG_MODULE" 2>/dev/null | grep -q "\"${PKG_MODULE}\""; then
+        ok "$PKG_MODULE module available"
+    else
+        warn "$PKG_MODULE module missing (needed for package installs) -> package ${PKG_FOR[ansible-playbook]}"
+        MISSING+=("${PKG_FOR[ansible-playbook]}")
+    fi
+fi
+
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     mapfile -t MISSING < <(printf '%s\n' "${MISSING[@]}" | sort -u)
     echo
     echo "  Missing: ${MISSING[*]}"
-    if [[ $ASSUME_YES -eq 1 ]] || ask_yn "Install them now with '${SUDO:+sudo }${PKG_MGR} install ${MISSING[*]}'?" y; then
-        if ! $SUDO "$PKG_MGR" install -y "${MISSING[@]}"; then
+    [[ "$PLATFORM" == archlinux ]] && echo "  (On Arch this syncs the package databases and upgrades the system, as Arch requires.)"
+    if [[ $ASSUME_YES -eq 1 ]] || ask_yn "Install them now with '${SUDO:+sudo }${PKG_INSTALL[*]} ${MISSING[*]}'?" y; then
+        if [[ ${#PKG_REFRESH[@]} -gt 0 ]] && ! $SUDO "${PKG_REFRESH[@]}"; then
+            die "'${PKG_REFRESH[*]}' failed; check your network and package sources, then re-run."
+        fi
+        if ! $SUDO "${PKG_INSTALL[@]}" "${MISSING[@]}"; then
             if [[ $IS_RHEL -eq 1 ]]; then
                 die "${PKG_MGR} failed. On RHEL these packages come from BaseOS/AppStream: make sure the host is registered (sudo subscription-manager register) and try again."
             fi

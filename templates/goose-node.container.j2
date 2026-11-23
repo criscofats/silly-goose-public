@@ -25,10 +25,10 @@ Volume={{ vm_name }}-var:/var:Z
 # authenticates with /etc/pki/consumer/cert.pem.
 Volume={{ vm_name }}-rhsm-consumer:/etc/pki/consumer:Z
 Volume={{ vm_name }}-rhsm-entitlement:/etc/pki/entitlement:Z
-{% if registration_enabled %}
+{% if registration_enabled | bool %}
 Volume={{ credstore_dir }}:/run/credstore:ro,Z
 {% endif %}
-PodmanArgs=--systemd=always{% if podman_privileged %} --privileged{% endif %}
+PodmanArgs=--systemd=always{% if podman_privileged | bool %} --privileged{% endif %}
 
 
 [Service]

@@ -1,0 +1,24 @@
+---
+# Host settings for Arch Linux (pacman, systemd, modular libvirt daemons).
+# dnsmasq is required for libvirt's default NAT network.
+
+host_container_packages:
+  - podman
+
+host_kvm_packages:
+  - libvirt
+  - virt-install
+  - qemu-base
+  - dnsmasq
+
+host_libvirt_services:
+  - virtqemud.socket
+  - virtnetworkd.socket
+  - virtstoraged.socket
+
+# Sync the package databases before installing.
+host_package_update_cache: true
+
+# ansible.builtin.package uses pacman from the community.general collection,
+# which the full "ansible" package includes (ansible-core alone does not).
+host_package_module: community.general.pacman
